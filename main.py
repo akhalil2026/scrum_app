@@ -550,7 +550,7 @@ def open_team_tickets_dashboard(config):
         # fetches/teams can leave stale names selected that no longer match
         # anyone in view (silently filtering out everything). Owner therefore
         # always starts fully selected on every fresh load.
-        activity_filter = {"selected": _load_saved_filter_selection(config, "team_tickets", "activity", set()), "btn": None, "window": None}
+        activity_filter = {"selected": _load_saved_filter_selection(config, "team_tickets", "activity", activities), "btn": None, "window": None}
         validation_filter = {"selected": _load_saved_filter_selection(config, "team_tickets", "validation", validations), "btn": None, "window": None}
         status_filter = {"selected": _load_saved_filter_selection(config, "team_tickets", "status", ALL_STATUS_VALUES), "btn": None, "window": None}
         owner_filter = {"selected": set(owners), "btn": None, "window": None}
@@ -1224,7 +1224,7 @@ def open_teams_overview_dashboard(config):
         # don't exist on the newly-selected team (silently filtering out
         # everything). Owner therefore always starts fully selected on every
         # fresh load/team switch.
-        activity_filter = {"selected": _load_saved_filter_selection(config, "teams_overview", "activity", set()), "btn": None, "window": None}
+        activity_filter = {"selected": _load_saved_filter_selection(config, "teams_overview", "activity", activities), "btn": None, "window": None}
         validation_filter = {"selected": _load_saved_filter_selection(config, "teams_overview", "validation", validations), "btn": None, "window": None}
         status_filter = {"selected": _load_saved_filter_selection(config, "teams_overview", "status", ALL_STATUS_VALUES), "btn": None, "window": None}
         owner_filter = {"selected": set(owners), "btn": None, "window": None}
@@ -1632,12 +1632,13 @@ def run_dashboard(config):
     app.configure(fg_color=APP_BG)
     start_scheduler(app)
 
-    # Activity filter now defaults to none-checked (= show all tickets).
-    # Clear any previously saved pref so old config.json files do not
-    # restore the old all-checked behaviour.
+    # Activity and validation filters default to all-checked (same as owner/status).
+    # Wipe any previously saved partial selection so stale config.json entries
+    # never leave users with a subset still ticked after an app restart.
     for _dk in ("team_tickets", "teams_overview"):
         try:
             config.get("filter_prefs", {}).get(_dk, {}).pop("activity", None)
+            config.get("filter_prefs", {}).get(_dk, {}).pop("validation", None)
         except Exception:
             pass
 
@@ -2551,4 +2552,3 @@ if __name__ == "__main__":
         logged_out = run_dashboard(conf)
         if not logged_out:
             break
-        
