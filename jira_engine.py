@@ -492,9 +492,14 @@ def get_team_overview_data(config, team_name):
         data   = {"todo": [], "in_progress": [], "approved": [], "blocked": [], "partially_blocked": [], "done": []}
         totals = {"todo": 0,  "in_progress": 0,  "approved": 0,  "blocked": 0,  "partially_blocked": 0,  "done": 0}
         total_logged = 0
+        seen_keys = set()  # guard against duplicate issues (multiple open sprints)
 
         for issue in all_issues:
             key, f = issue["key"], issue["fields"]
+
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
 
             if not _team_matches(team_name, f.get(team_field_id) if team_field_id else None, key):
                 continue
