@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 from tkinter import filedialog, messagebox
 from PIL import Image
 from config import load_config, save_config, clear_config, TEAMS_LIST, REFRESH_INTERVAL , HOURS_PER_DAY 
-from jira_engine import get_jira_data, get_team_overview_data, get_team_member_logging, get_current_sprint, calculate_expected_hours, calculate_expected_hours_j1, format_time, get_user_identity, get_achieved_tcs_field_id, get_achieved_reqs_field_id, get_achieved_tickets_field_id, get_ticket_checklist, get_all_teams
+from jira_engine import get_jira_data, get_team_overview_data, get_team_overview_and_logging, get_team_member_logging, get_current_sprint, calculate_expected_hours, calculate_expected_hours_j1, format_time, get_user_identity, get_achieved_tcs_field_id, get_achieved_reqs_field_id, get_achieved_tickets_field_id, get_ticket_checklist, get_all_teams
 from notifications import start_scheduler
 
 # =========================================================
@@ -54,9 +54,7 @@ def _warm_checklist_cache(config, ticket_keys):
 ALL_STATUS_VALUES = {"TODO", "IN_PROGRESS", "APPROVED", "BLOCKED", "PARTIALLY_BLOCKED", "DONE"}
 
 def _load_saved_filter_selection(config, dashboard_key, filter_name, fallback_values):
-    """Return a set of saved selections for dashboard_key/filter_name, or fallback_values if none saved yet.
-    For activity filters (fallback_values is an empty set), a saved non-empty list is returned as-is
-    so explicit user choices are preserved. If no saved value exists, fallback_values is returned."""
+    """Return a set of saved selections for dashboard_key/filter_name, or all fallback_values if none saved yet."""
     saved = config.get("filter_prefs", {}).get(dashboard_key, {}).get(filter_name)
     if saved is None:
         return set(fallback_values)
@@ -550,8 +548,8 @@ def open_team_tickets_dashboard(config):
         # fetches/teams can leave stale names selected that no longer match
         # anyone in view (silently filtering out everything). Owner therefore
         # always starts fully selected on every fresh load.
-        activity_filter = {"selected": set(activities), "btn": None, "window": None}
-        validation_filter = {"selected": set(validations), "btn": None, "window": None}
+        activity_filter = {"selected": _load_saved_filter_selection(config, "team_tickets", "activity", activities), "btn": None, "window": None}
+        validation_filter = {"selected": _load_saved_filter_selection(config, "team_tickets", "validation", validations), "btn": None, "window": None}
         status_filter = {"selected": _load_saved_filter_selection(config, "team_tickets", "status", ALL_STATUS_VALUES), "btn": None, "window": None}
         owner_filter = {"selected": set(owners), "btn": None, "window": None}
         
@@ -1224,8 +1222,8 @@ def open_teams_overview_dashboard(config):
         # don't exist on the newly-selected team (silently filtering out
         # everything). Owner therefore always starts fully selected on every
         # fresh load/team switch.
-        activity_filter = {"selected": set(activities), "btn": None, "window": None}
-        validation_filter = {"selected": set(validations), "btn": None, "window": None}
+        activity_filter = {"selected": _load_saved_filter_selection(config, "teams_overview", "activity", activities), "btn": None, "window": None}
+        validation_filter = {"selected": _load_saved_filter_selection(config, "teams_overview", "validation", validations), "btn": None, "window": None}
         status_filter = {"selected": _load_saved_filter_selection(config, "teams_overview", "status", ALL_STATUS_VALUES), "btn": None, "window": None}
         owner_filter = {"selected": set(owners), "btn": None, "window": None}
         
@@ -1527,35 +1525,37 @@ def open_teams_overview_dashboard(config):
         def do_fetch():
             if cancelled["value"]: return
             try:
-                sprint = get_current_sprint(config)
+                # get_current_sprint and the team data fetch are independent
+                # Jira calls, so run them in parallel rather than sequentially.
+                sprint_result = [None]
+                fetch_result  = [None]
+                errors        = []
 
-                # Run both fetches in parallel threads
-                ticket_result  = [None]
-                logging_result = [None]
-                errors         = []
-
-                def fetch_tickets():
+                def fetch_sprint():
                     try:
-                        data, totals, total_logged = get_team_overview_data(config, team_name)
-                        ticket_result[0] = data
+                        sprint_result[0] = get_current_sprint(config)
                     except Exception as e:
                         errors.append(e)
 
-                def fetch_logging():
+                def fetch_team_data():
                     try:
-                        logging_result[0] = get_team_member_logging(config, team_name)
+                        # Single combined fetch: one Jira search + one worklog
+                        # resolve pass instead of two separate full fetches.
+                        fetch_result[0] = get_team_overview_and_logging(config, team_name)
                     except Exception as e:
                         errors.append(e)
 
-                t1 = threading.Thread(target=fetch_tickets,  daemon=True)
-                t2 = threading.Thread(target=fetch_logging,  daemon=True)
+                t1 = threading.Thread(target=fetch_sprint,     daemon=True)
+                t2 = threading.Thread(target=fetch_team_data,  daemon=True)
                 t1.start(); t2.start()
                 t1.join();  t2.join()
 
                 if cancelled["value"]: return
 
+                sprint = sprint_result[0]
+                data, totals, total_logged, member_logged = fetch_result[0] or (None, None, None, {})
+
                 # populate ticket data
-                data = ticket_result[0]
                 if data:
                     for lane in ["todo", "in_progress", "approved", "blocked", "partially_blocked", "done"]:
                         for tick in data.get(lane, []):
@@ -1575,7 +1575,7 @@ def open_teams_overview_dashboard(config):
                     win.after(0, lambda: _show_no_results(team_name))
 
                 # render member cards (even if ticket fetch failed)
-                member_logged = logging_result[0] or {}
+                member_logged = member_logged or {}
                 win.after(0, lambda ml=member_logged, sp=sprint: render_member_logging(ml, sp))
 
             except Exception as e:
@@ -1608,10 +1608,9 @@ def open_teams_overview_dashboard(config):
         if not new_selectable:
             return
         team_drop.configure(values=new_selectable)
-        # Only re-fetch if the current team no longer exists (e.g. renamed/removed).
-        # Do NOT re-fetch when the team is still valid — the initial fetch on window
-        # open already loaded it, and a second fetch would append duplicate tickets
-        # into raw_aggregated.
+        # If the team we were viewing no longer exists under its old name,
+        # fall back to the first available team instead of silently showing
+        # a now-invalid selection.
         if current_team["value"] not in new_selectable:
             current_team["value"] = new_selectable[0]
             team_drop.set(current_team["value"])

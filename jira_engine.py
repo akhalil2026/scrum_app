@@ -3,10 +3,41 @@ import json
 import requests
 from requests.auth import HTTPBasicAuth
 from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor
 from config import DOMAIN, HOURS_PER_DAY, WORK_START
 
 # ── field-id cache (avoids repeated /field API calls per session) ──────────
 _field_cache = {}
+
+def _fetch_full_worklogs(config, key):
+    """Fetch the complete worklog list for a single issue. Used when Jira's
+    inline worklog payload is truncated (it only returns the first 20)."""
+    try:
+        full = requests.get(
+            f"https://{DOMAIN}/rest/api/2/issue/{key}/worklog",
+            auth=HTTPBasicAuth(config["user"], config["token"]),
+            timeout=10
+        ).json()
+        return key, full.get("worklogs", [])
+    except Exception as e:
+        print(f"[worklog fetch] {key}: {e}")
+        return key, None
+
+def _resolve_worklogs(config, issues_needing_fetch):
+    """
+    Concurrently fetch full worklogs for every issue whose inline payload was
+    truncated, instead of one blocking request per ticket in a sequential
+    loop. Returns {issue_key: worklogs_list}. Falls back silently (caller
+    keeps the truncated inline list) for any key not present in the result.
+    """
+    results = {}
+    if not issues_needing_fetch:
+        return results
+    with ThreadPoolExecutor(max_workers=10) as pool:
+        for key, worklogs in pool.map(lambda k: _fetch_full_worklogs(config, k), issues_needing_fetch):
+            if worklogs is not None:
+                results[key] = worklogs
+    return results
 
 def format_time(seconds):
     if not seconds or seconds <= 0: return "0m"
@@ -48,6 +79,8 @@ def get_current_sprint(config):
     Return the most recently started active sprint across all boards.
     Picking the sprint with the latest startDate avoids stale sprints on
     long-running boards from poisoning the expected-hours calculation.
+    Board sprint lookups run concurrently — sequential per-board requests
+    were a slow point on instances with many boards.
     """
     try:
         boards_resp = requests.get(
@@ -55,16 +88,27 @@ def get_current_sprint(config):
             auth=HTTPBasicAuth(config["user"], config["token"]),
             timeout=10
         ).json()
-        best_sprint = None
-        best_start  = None
-        for board in boards_resp.get("values", []):
+        board_ids = [b["id"] for b in boards_resp.get("values", [])]
+        if not board_ids:
+            return None
+
+        def _fetch_board_sprints(board_id):
             try:
                 res = requests.get(
-                    f"https://{DOMAIN}/rest/agile/1.0/board/{board['id']}/sprint?state=active",
+                    f"https://{DOMAIN}/rest/agile/1.0/board/{board_id}/sprint?state=active",
                     auth=HTTPBasicAuth(config["user"], config["token"]),
                     timeout=10
                 ).json()
-                for sprint in res.get("values", []):
+                return res.get("values", [])
+            except Exception as e:
+                print(f"[get_current_sprint] Board {board_id} error: {e}")
+                return []
+
+        best_sprint = None
+        best_start  = None
+        with ThreadPoolExecutor(max_workers=10) as pool:
+            for sprints in pool.map(_fetch_board_sprints, board_ids):
+                for sprint in sprints:
                     raw_start = sprint.get("startDate")
                     if not raw_start:
                         continue
@@ -79,9 +123,6 @@ def get_current_sprint(config):
                     if best_start is None or start_dt > best_start:
                         best_sprint = sprint
                         best_start  = start_dt
-            except Exception as e:
-                print(f"[get_current_sprint] Board {board.get('id')} error: {e}")
-                continue
         return best_sprint
     except Exception as e:
         print(f"[get_current_sprint] Error: {e}")
@@ -327,17 +368,32 @@ def _int_field(fields, fid):
 
 # ── public data-fetch functions ────────────────────────────────────────────
 
-def get_team_member_logging(config, team_name):
+def get_team_overview_and_logging(config, team_name):
     """
-    For each assignee with tickets in team_name, sum the seconds they personally
-    logged across all team tickets in the open sprint.
-    Returns: {display_name: logged_seconds}  or  {} on failure.
-    """
-    team_field_id = get_team_field_name(config)
+    Single combined fetch that replaces what used to be two separate calls
+    (get_team_overview_data + get_team_member_logging), each running its own
+    full JQL search + pagination + worklog-resolve pass over essentially the
+    same ticket set. Doing it once here halves the Jira search load and the
+    number of worklog-refetch requests needed per team-overview load.
 
-    jql    = "sprint in openSprints() AND issuetype = 'Task'AND project = SytProjectMgt"
-    fields = "summary,worklog,assignee"
-    if team_field_id: fields += f",{team_field_id}"
+    Returns: (data, totals, total_logged, member_logged) or
+             (None, None, None, {}) on failure.
+    """
+    team_field_id        = get_team_field_name(config)
+    custom_labels_id     = get_custom_labels_field_name(config)
+    validation_name_id   = get_validation_name_field_name(config)
+    achieved_tcs_id      = get_achieved_tcs_field_id(config)
+    achieved_reqs_id     = get_achieved_reqs_field_id(config)
+    achieved_tickets_id  = get_achieved_tickets_field_id(config)
+
+    jql = "sprint in openSprints() AND issuetype = 'Task' AND project = SytProjectMgt"
+    fields = "summary,timeoriginalestimate,timeestimate,status,worklog,assignee"
+    if team_field_id:       fields += f",{team_field_id}"
+    if custom_labels_id:    fields += f",{custom_labels_id}"
+    if validation_name_id:  fields += f",{validation_name_id}"
+    if achieved_tcs_id:     fields += f",{achieved_tcs_id}"
+    if achieved_reqs_id:    fields += f",{achieved_reqs_id}"
+    if achieved_tickets_id: fields += f",{achieved_tickets_id}"
 
     try:
         all_issues, start_at, page = [], 0, 100
@@ -350,54 +406,117 @@ def get_team_member_logging(config, team_name):
             ).json()
             batch = resp.get("issues", [])
             all_issues.extend(batch)
-            if len(batch) < page: break
+            if len(batch) < page:
+                break
             start_at += page
 
-        # member_logged: { display_name -> seconds }
+        data   = {"todo": [], "in_progress": [], "approved": [], "blocked": [], "partially_blocked": [], "done": []}
+        totals = {"todo": 0,  "in_progress": 0,  "approved": 0,  "blocked": 0,  "partially_blocked": 0,  "done": 0}
+        total_logged  = 0
         member_logged = {}
+        seen_keys = set()  # guard against duplicate issues (multiple open sprints)
 
+        # Pass 1: figure out which (already team-matched, deduped) issues need
+        # a full worklog refetch, then fetch them all CONCURRENTLY instead of
+        # one-by-one — this is the main source of slowness on larger sprints.
+        relevant_issues = []
+        needs_fetch = []
         for issue in all_issues:
             key, f = issue["key"], issue["fields"]
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
             if not _team_matches(team_name, f.get(team_field_id) if team_field_id else None, key):
                 continue
+            relevant_issues.append(issue)
+            w_data = f.get("worklog", {})
+            if w_data.get("total", 0) > len(w_data.get("worklogs", [])):
+                needs_fetch.append(key)
+
+        fetched_worklogs = _resolve_worklogs(config, needs_fetch)
+
+        # Pass 2: build tickets + lane totals + per-member logging together,
+        # in one loop, off the one shared worklog dataset.
+        for issue in relevant_issues:
+            key, f = issue["key"], issue["fields"]
 
             assignee = f.get("assignee") or {}
             owner = (assignee.get("displayName") or assignee.get("name")
                      or assignee.get("emailAddress") or "Unassigned")
 
-            # get full worklog list if truncated
             w_data = f.get("worklog", {})
-            if w_data.get("total", 0) > len(w_data.get("worklogs", [])):
-                try:
-                    full = requests.get(
-                        f"https://{DOMAIN}/rest/api/2/issue/{key}/worklog",
-                        auth=HTTPBasicAuth(config["user"], config["token"]),
-                        timeout=10
-                    ).json()
-                    worklogs = full.get("worklogs", [])
-                except Exception as e:
-                    print(f"[worklog fetch] {key}: {e}")
-                    worklogs = w_data.get("worklogs", [])
-            else:
-                worklogs = w_data.get("worklogs", [])
+            worklogs = fetched_worklogs.get(key, w_data.get("worklogs", []))
 
-            # credit each log entry to its author (not necessarily the assignee)
+            spent = sum(log.get("timeSpentSeconds", 0) for log in worklogs)
+            total_logged += spent
+
+            # per-member logging — credit each log entry to its author
             for log in worklogs:
                 author = log.get("author", {})
                 author_name = (author.get("displayName") or author.get("name")
                                or author.get("emailAddress") or owner)
                 seconds = log.get("timeSpentSeconds", 0)
                 member_logged[author_name] = member_logged.get(author_name, 0) + seconds
-
-            # ensure the assignee appears even with 0 logged
             if owner not in member_logged:
                 member_logged[owner] = 0
 
-        return member_logged
+            rem = (f.get("timeestimate") if f.get("timeestimate") is not None
+                   else max((f.get("timeoriginalestimate") or 0) - spent, 0))
+
+            est_time = f.get("timeoriginalestimate", 0)
+            est_time_formatted = format_time(est_time) if est_time else "0h"
+
+            status_obj = f.get("status", {})
+            st_name = status_obj.get("name", "")
+            st_cat  = status_obj.get("statusCategory", {}).get("key", "")
+
+            activity_label   = _extract_field_value(f.get(custom_labels_id)   if custom_labels_id   else None)
+            validation_label = _extract_field_value(f.get(validation_name_id) if validation_name_id else None)
+
+            achieved_tcs     = _int_field(f, achieved_tcs_id)
+            achieved_reqs    = _int_field(f, achieved_reqs_id)
+            achieved_tickets = _int_field(f, achieved_tickets_id)
+
+            ticket = (key, f["summary"], f"https://{DOMAIN}/browse/{key}",
+                      format_time(spent), format_time(rem),
+                      activity_label, validation_label, owner,
+                      est_time_formatted,
+                      achieved_tcs, achieved_reqs, achieved_tickets)
+
+            if st_name == "Approved":
+                data["approved"].append(ticket); totals["approved"] += spent
+            elif st_name == "Blocked":
+                data["blocked"].append(ticket);  totals["blocked"]  += spent
+            elif st_name == "Partially Blocked":
+                data["partially_blocked"].append(ticket); totals["partially_blocked"] += spent
+            elif st_cat == "done":
+                data["done"].append(ticket);     totals["done"]     += spent
+            elif st_cat == "indeterminate":
+                data["in_progress"].append(ticket); totals["in_progress"] += spent
+            else:
+                data["todo"].append(ticket);     totals["todo"]     += spent
+
+        return data, totals, total_logged, member_logged
 
     except Exception as e:
-        print(f"[get_team_member_logging] Error: {e}")
-        return {}
+        print(f"[get_team_overview_and_logging] Error: {e}")
+        return None, None, None, {}
+
+
+def get_team_member_logging(config, team_name):
+    """Back-compat wrapper. Prefer get_team_overview_and_logging for callers
+    that need both ticket data and member logging — calling both this and
+    get_team_overview_data separately re-runs the same Jira search twice."""
+    _, _, _, member_logged = get_team_overview_and_logging(config, team_name)
+    return member_logged
+
+
+def get_team_overview_data(config, team_name):
+    """Back-compat wrapper. Prefer get_team_overview_and_logging for callers
+    that need both ticket data and member logging — calling both this and
+    get_team_member_logging separately re-runs the same Jira search twice."""
+    data, totals, total_logged, _ = get_team_overview_and_logging(config, team_name)
+    return data, totals, total_logged
 
 
 def get_all_teams(config):
@@ -452,125 +571,6 @@ def get_all_teams(config):
         return ["All Teams"]
 
 
-def get_team_overview_data(config, team_name):
-    """
-    Fetch all open-sprint tickets for team_name directly from Jira.
-    No predefined member list — assignees discovered dynamically.
-    Returns: (data, totals, total_logged) or (None, None, None) on failure.
-    """
-    team_field_id        = get_team_field_name(config)
-    custom_labels_id     = get_custom_labels_field_name(config)
-    validation_name_id   = get_validation_name_field_name(config)
-    achieved_tcs_id      = get_achieved_tcs_field_id(config)
-    achieved_reqs_id     = get_achieved_reqs_field_id(config)
-    achieved_tickets_id  = get_achieved_tickets_field_id(config)
-
-    jql = "sprint in openSprints() AND issuetype = 'Task' AND project = SytProjectMgt"
-    fields = "summary,timeoriginalestimate,timeestimate,status,worklog,assignee"
-    if team_field_id:       fields += f",{team_field_id}"
-    if custom_labels_id:    fields += f",{custom_labels_id}"
-    if validation_name_id:  fields += f",{validation_name_id}"
-    if achieved_tcs_id:     fields += f",{achieved_tcs_id}"
-    if achieved_reqs_id:    fields += f",{achieved_reqs_id}"
-    if achieved_tickets_id: fields += f",{achieved_tickets_id}"
-
-    try:
-        all_issues, start_at, page = [], 0, 100
-        while True:
-            resp = requests.get(
-                f"https://{DOMAIN}/rest/api/2/search",
-                params={"jql": jql, "fields": fields, "maxResults": page, "startAt": start_at},
-                auth=HTTPBasicAuth(config["user"], config["token"]),
-                timeout=20
-            ).json()
-            batch = resp.get("issues", [])
-            all_issues.extend(batch)
-            if len(batch) < page:
-                break
-            start_at += page
-
-        data   = {"todo": [], "in_progress": [], "approved": [], "blocked": [], "partially_blocked": [], "done": []}
-        totals = {"todo": 0,  "in_progress": 0,  "approved": 0,  "blocked": 0,  "partially_blocked": 0,  "done": 0}
-        total_logged = 0
-        seen_keys = set()  # guard against duplicate issues (multiple open sprints)
-
-        for issue in all_issues:
-            key, f = issue["key"], issue["fields"]
-
-            if key in seen_keys:
-                continue
-            seen_keys.add(key)
-
-            if not _team_matches(team_name, f.get(team_field_id) if team_field_id else None, key):
-                continue
-
-            # Assignee
-            assignee = f.get("assignee") or {}
-            owner = (assignee.get("displayName") or assignee.get("name")
-                     or assignee.get("emailAddress") or "Unassigned")
-
-            # Worklogs — Jira returns max 20 inline; fetch full list if truncated
-            w_data = f.get("worklog", {})
-            if w_data.get("total", 0) > len(w_data.get("worklogs", [])):
-                try:
-                    full = requests.get(
-                        f"https://{DOMAIN}/rest/api/2/issue/{key}/worklog",
-                        auth=HTTPBasicAuth(config["user"], config["token"]),
-                        timeout=10
-                    ).json()
-                    worklogs = full.get("worklogs", [])
-                except Exception as e:
-                    print(f"[worklog fetch] {key}: {e}")
-                    worklogs = w_data.get("worklogs", [])
-            else:
-                worklogs = w_data.get("worklogs", [])
-
-            spent = sum(log.get("timeSpentSeconds", 0) for log in worklogs)
-            total_logged += spent
-
-            rem = (f.get("timeestimate") if f.get("timeestimate") is not None
-                   else max((f.get("timeoriginalestimate") or 0) - spent, 0))
-
-            est_time = f.get("timeoriginalestimate", 0)
-            est_time_formatted = format_time(est_time) if est_time else "0h"
-
-            status_obj = f.get("status", {})
-            st_name = status_obj.get("name", "")
-            st_cat  = status_obj.get("statusCategory", {}).get("key", "")
-
-            activity_label   = _extract_field_value(f.get(custom_labels_id)   if custom_labels_id   else None)
-            validation_label = _extract_field_value(f.get(validation_name_id) if validation_name_id else None)
-
-            achieved_tcs     = _int_field(f, achieved_tcs_id)
-            achieved_reqs    = _int_field(f, achieved_reqs_id)
-            achieved_tickets = _int_field(f, achieved_tickets_id)
-
-            ticket = (key, f["summary"], f"https://{DOMAIN}/browse/{key}",
-                      format_time(spent), format_time(rem),
-                      activity_label, validation_label, owner,
-                      est_time_formatted,
-                      achieved_tcs, achieved_reqs, achieved_tickets)
-
-            if st_name == "Approved":
-                data["approved"].append(ticket); totals["approved"] += spent
-            elif st_name == "Blocked":
-                data["blocked"].append(ticket);  totals["blocked"]  += spent
-            elif st_name == "Partially Blocked":
-                data["partially_blocked"].append(ticket); totals["partially_blocked"] += spent
-            elif st_cat == "done":
-                data["done"].append(ticket);     totals["done"]     += spent
-            elif st_cat == "indeterminate":
-                data["in_progress"].append(ticket); totals["in_progress"] += spent
-            else:
-                data["todo"].append(ticket);     totals["todo"]     += spent
-
-        return data, totals, total_logged
-
-    except Exception as e:
-        print(f"[get_team_overview_data] Error: {e}")
-        return None, None, None
-
-
 def get_jira_data(config, target_username=None, force_team_filter=None):
     identity = get_user_identity(config, target_username)
     if not identity or "error" in identity:
@@ -608,31 +608,27 @@ def get_jira_data(config, target_username=None, force_team_filter=None):
         totals = {"todo": 0,  "in_progress": 0,  "approved": 0,  "blocked": 0,  "partially_blocked": 0,  "done": 0}
         total_logged = 0
 
+        relevant_issues = []
+        needs_fetch = []
         for issue in response.get("issues", []):
             key, f = issue["key"], issue["fields"]
-
-            # Team filter
             if force_team_filter and force_team_filter != "All Teams":
                 if not _team_matches(force_team_filter,
                                      f.get(team_field_id) if team_field_id else None,
                                      key):
                     continue
-
-            # Worklogs — only count this user's time
-            w_data   = f.get("worklog", {})
+            relevant_issues.append(issue)
+            w_data = f.get("worklog", {})
             if w_data.get("total", 0) > len(w_data.get("worklogs", [])):
-                try:
-                    full = requests.get(
-                        f"https://{DOMAIN}/rest/api/2/issue/{key}/worklog",
-                        auth=HTTPBasicAuth(config["user"], config["token"]),
-                        timeout=10
-                    ).json()
-                    worklogs = full.get("worklogs", [])
-                except Exception as e:
-                    print(f"[worklog fetch] {key}: {e}")
-                    worklogs = w_data.get("worklogs", [])
-            else:
-                worklogs = w_data.get("worklogs", [])
+                needs_fetch.append(key)
+
+        fetched_worklogs = _resolve_worklogs(config, needs_fetch)
+
+        for issue in relevant_issues:
+            key, f = issue["key"], issue["fields"]
+
+            w_data = f.get("worklog", {})
+            worklogs = fetched_worklogs.get(key, w_data.get("worklogs", []))
 
             spent = 0
             for log in worklogs:
