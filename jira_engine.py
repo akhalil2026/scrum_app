@@ -2,7 +2,7 @@ import re
 import json
 import requests
 from requests.auth import HTTPBasicAuth
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor
 from config import DOMAIN, HOURS_PER_DAY, WORK_START
 
@@ -127,6 +127,68 @@ def get_current_sprint(config):
     except Exception as e:
         print(f"[get_current_sprint] Error: {e}")
     return None
+
+
+def get_all_open_sprints(config):
+    """
+    Return ALL currently active sprints across every board, sorted by
+    startDate descending (newest first) — so the most recent one appears
+    at the top of the picker dropdown.
+
+    Each entry is the raw Jira sprint dict, which includes at minimum:
+        id, name, startDate, endDate, state, originBoardId
+
+    This is used by the sprint-picker dropdown in the UI so the user can
+    manually select the correct sprint when Jira has multiple open at once
+    (e.g. a new sprint started while the old one wasn't closed yet).
+
+    Returns an empty list if the request fails or no active sprints exist.
+    """
+    try:
+        boards_resp = requests.get(
+            f"https://{DOMAIN}/rest/agile/1.0/board",
+            auth=HTTPBasicAuth(config["user"], config["token"]),
+            timeout=10
+        ).json()
+        board_ids = [b["id"] for b in boards_resp.get("values", [])]
+        if not board_ids:
+            return []
+
+        def _fetch_sprints(board_id):
+            try:
+                res = requests.get(
+                    f"https://{DOMAIN}/rest/agile/1.0/board/{board_id}/sprint?state=active",
+                    auth=HTTPBasicAuth(config["user"], config["token"]),
+                    timeout=10
+                ).json()
+                return res.get("values", [])
+            except Exception:
+                return []
+
+        seen_ids = set()    # De-duplicate: the same sprint can appear on multiple boards.
+        all_sprints = []
+        with ThreadPoolExecutor(max_workers=10) as pool:
+            for sprints in pool.map(_fetch_sprints, board_ids):
+                for sprint in sprints:
+                    sid = sprint.get("id")
+                    if sid and sid not in seen_ids:
+                        seen_ids.add(sid)
+                        all_sprints.append(sprint)
+
+        # Sort newest-first so the most relevant sprint is at the top.
+        def _start_key(s):
+            try:
+                return datetime.fromisoformat(s.get("startDate", "").replace("Z", "+00:00"))
+            except Exception:
+                return datetime.min.replace(tzinfo=timezone.utc)
+
+        all_sprints.sort(key=_start_key, reverse=True)
+        return all_sprints
+
+    except Exception as e:
+        print(f"[get_all_open_sprints] Error: {e}")
+        return []
+
 
 def calculate_expected_hours(start_date):
     try:
