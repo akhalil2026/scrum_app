@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 from tkinter import filedialog, messagebox
 from PIL import Image
 from config import load_config, save_config, clear_config, TEAMS_LIST, REFRESH_INTERVAL , HOURS_PER_DAY 
-from jira_engine import get_jira_data, get_team_overview_data, get_team_overview_and_logging, get_team_member_logging, get_current_sprint, calculate_expected_hours, calculate_expected_hours_j1, format_time, get_user_identity, get_achieved_tcs_field_id, get_achieved_reqs_field_id, get_achieved_tickets_field_id, get_ticket_checklist, get_all_teams
+from jira_engine import get_jira_data, get_team_overview_data, get_team_member_logging, get_current_sprint, get_all_open_sprints, calculate_expected_hours, calculate_expected_hours_j1, format_time, get_user_identity, get_achieved_tcs_field_id, get_achieved_reqs_field_id, get_achieved_tickets_field_id, get_ticket_checklist, get_all_teams
 from notifications import start_scheduler
 
 # =========================================================
@@ -90,13 +90,8 @@ def get_teams_list(config):
 
 def _refresh_teams_list_async(config, on_done=None):
     """
-    Background-thread refresh of the dynamic team list. Safe to call as
-    often as you like (e.g. on every dashboard open, or via a manual
-    refresh button) — it's a single lightweight Jira query.
-
-    on_done: optional zero-arg callback invoked on the calling thread once
-    the refresh finishes (only fired if the list actually changed), so a
-    caller can update an already-open dropdown's values.
+    Background-thread refresh of the dynamic team list.
+    on_done: optional zero-arg callback fired (on calling thread) when the list actually changes.
     """
     def _work():
         try:
@@ -104,7 +99,7 @@ def _refresh_teams_list_async(config, on_done=None):
         except Exception:
             return
         if not fresh or len(fresh) <= 1:
-            return  # Nothing useful came back (e.g. offline) — keep whatever we already had.
+            return
         changed = fresh != config.get("dynamic_teams_list")
         config["dynamic_teams_list"] = fresh
         save_config(config)
@@ -113,6 +108,47 @@ def _refresh_teams_list_async(config, on_done=None):
     threading.Thread(target=_work, daemon=True).start()
 
 # =========================================================
+# 🗓️ SPRINT DATE OVERRIDE
+# Lets the user pin a specific sprint start/end date instead of relying
+# on Jira's auto-detected "current sprint" (which can pick the wrong one
+# when multiple sprints are open simultaneously).
+#
+# If config["manual_sprint_start"] and config["manual_sprint_end"] are set,
+# get_effective_sprint() returns a synthetic sprint dict built from those
+# dates.  Otherwise it falls back to get_current_sprint() as before.
+# =========================================================
+def get_effective_sprint(config):
+    """Return the sprint dict to use for all time calculations.
+
+    Priority order:
+      1. Pinned sprint by ID (config["pinned_sprint"]) — set when the user
+         picks a specific sprint from the sprint-picker dropdown. The full
+         sprint dict is stored so no extra Jira call is needed here.
+      2. Manual date override (config["manual_sprint_start"/"end"]) — set
+         when the user types custom start/end dates in the date-picker popup.
+      3. Auto-detected sprint from Jira (get_current_sprint) — original logic,
+         used when neither override is active.
+    """
+    # Option 1: user picked a specific sprint from the dropdown → use it directly.
+    pinned = config.get("pinned_sprint")
+    if pinned and pinned.get("startDate") and pinned.get("endDate"):
+        pinned["_manual"] = True   # sentinel so the UI can show a "manual" badge
+        return pinned
+
+    # Option 2: user typed custom start/end dates.
+    manual_start = config.get("manual_sprint_start")
+    manual_end   = config.get("manual_sprint_end")
+    if manual_start and manual_end:
+        return {
+            "startDate": manual_start,
+            "endDate":   manual_end,
+            "name":      config.get("manual_sprint_name", "Manual Sprint"),
+            "_manual":   True,
+        }
+
+    # Option 3: auto-detect from Jira (original behaviour).
+    return get_current_sprint(config)
+
 # 🎨 Global Premium SaaS Light/Dark Mode Configurations
 # =========================================================
 FONT_FAMILY = "Segoe UI"
@@ -240,7 +276,7 @@ def open_member_dashboard(config, username):
     def load():
         active_team = config.get("selected_team", "All Teams")
         tickets, totals, logged, _ = get_jira_data(config, username, force_team_filter=active_team)
-        sprint = get_current_sprint(config)
+        sprint = get_effective_sprint(config)
         if not tickets or cancelled["value"]: return
         team_dedications = config.get("team_member_dedications", {}).get(active_team, {})
         old_fallback = config.get("member_dedications", {}).get(username, 1.0)
@@ -548,8 +584,8 @@ def open_team_tickets_dashboard(config):
         # fetches/teams can leave stale names selected that no longer match
         # anyone in view (silently filtering out everything). Owner therefore
         # always starts fully selected on every fresh load.
-        activity_filter = {"selected": _load_saved_filter_selection(config, "team_tickets", "activity", activities), "btn": None, "window": None}
-        validation_filter = {"selected": _load_saved_filter_selection(config, "team_tickets", "validation", validations), "btn": None, "window": None}
+        activity_filter = {"selected": set(activities), "btn": None, "window": None}
+        validation_filter = {"selected": set(validations), "btn": None, "window": None}
         status_filter = {"selected": _load_saved_filter_selection(config, "team_tickets", "status", ALL_STATUS_VALUES), "btn": None, "window": None}
         owner_filter = {"selected": set(owners), "btn": None, "window": None}
         
@@ -1222,8 +1258,8 @@ def open_teams_overview_dashboard(config):
         # don't exist on the newly-selected team (silently filtering out
         # everything). Owner therefore always starts fully selected on every
         # fresh load/team switch.
-        activity_filter = {"selected": _load_saved_filter_selection(config, "teams_overview", "activity", activities), "btn": None, "window": None}
-        validation_filter = {"selected": _load_saved_filter_selection(config, "teams_overview", "validation", validations), "btn": None, "window": None}
+        activity_filter = {"selected": set(activities), "btn": None, "window": None}
+        validation_filter = {"selected": set(validations), "btn": None, "window": None}
         status_filter = {"selected": _load_saved_filter_selection(config, "teams_overview", "status", ALL_STATUS_VALUES), "btn": None, "window": None}
         owner_filter = {"selected": set(owners), "btn": None, "window": None}
         
@@ -1525,37 +1561,35 @@ def open_teams_overview_dashboard(config):
         def do_fetch():
             if cancelled["value"]: return
             try:
-                # get_current_sprint and the team data fetch are independent
-                # Jira calls, so run them in parallel rather than sequentially.
-                sprint_result = [None]
-                fetch_result  = [None]
-                errors        = []
+                sprint = get_effective_sprint(config)
 
-                def fetch_sprint():
+                # Run both fetches in parallel threads
+                ticket_result  = [None]
+                logging_result = [None]
+                errors         = []
+
+                def fetch_tickets():
                     try:
-                        sprint_result[0] = get_current_sprint(config)
+                        data, totals, total_logged = get_team_overview_data(config, team_name)
+                        ticket_result[0] = data
                     except Exception as e:
                         errors.append(e)
 
-                def fetch_team_data():
+                def fetch_logging():
                     try:
-                        # Single combined fetch: one Jira search + one worklog
-                        # resolve pass instead of two separate full fetches.
-                        fetch_result[0] = get_team_overview_and_logging(config, team_name)
+                        logging_result[0] = get_team_member_logging(config, team_name)
                     except Exception as e:
                         errors.append(e)
 
-                t1 = threading.Thread(target=fetch_sprint,     daemon=True)
-                t2 = threading.Thread(target=fetch_team_data,  daemon=True)
+                t1 = threading.Thread(target=fetch_tickets,  daemon=True)
+                t2 = threading.Thread(target=fetch_logging,  daemon=True)
                 t1.start(); t2.start()
                 t1.join();  t2.join()
 
                 if cancelled["value"]: return
 
-                sprint = sprint_result[0]
-                data, totals, total_logged, member_logged = fetch_result[0] or (None, None, None, {})
-
                 # populate ticket data
+                data = ticket_result[0]
                 if data:
                     for lane in ["todo", "in_progress", "approved", "blocked", "partially_blocked", "done"]:
                         for tick in data.get(lane, []):
@@ -1575,7 +1609,7 @@ def open_teams_overview_dashboard(config):
                     win.after(0, lambda: _show_no_results(team_name))
 
                 # render member cards (even if ticket fetch failed)
-                member_logged = member_logged or {}
+                member_logged = logging_result[0] or {}
                 win.after(0, lambda ml=member_logged, sp=sprint: render_member_logging(ml, sp))
 
             except Exception as e:
@@ -1608,9 +1642,9 @@ def open_teams_overview_dashboard(config):
         if not new_selectable:
             return
         team_drop.configure(values=new_selectable)
-        # If the team we were viewing no longer exists under its old name,
-        # fall back to the first available team instead of silently showing
-        # a now-invalid selection.
+        # Only re-fetch if the current team no longer exists (e.g. renamed/removed).
+        # Do NOT re-fetch when the team is still valid — the initial fetch on window
+        # open already loaded it, and a second fetch would append duplicate tickets.
         if current_team["value"] not in new_selectable:
             current_team["value"] = new_selectable[0]
             team_drop.set(current_team["value"])
@@ -1661,7 +1695,7 @@ def run_dashboard(config):
     sprint_name_lbl.pack(side="left", padx=(0, 20))
 
     def load_sprint_name():
-        sprint = get_current_sprint(config)
+        sprint = get_effective_sprint(config)
         name = sprint.get("name", "Unknown Sprint") if sprint else "No Active Sprint"
         app.after(0, lambda: sprint_name_lbl.configure(
             text=f"🏃 {name}",
@@ -1732,7 +1766,7 @@ def run_dashboard(config):
             def fetch():
                 config.setdefault("member_avatars", {})
                 tickets, _, logged, avatar_url = get_jira_data(config, u, force_team_filter=active_team)
-                sprint = get_current_sprint(config)
+                sprint = get_effective_sprint(config)
                 if avatar_url and isinstance(avatar_url, str): config["member_avatars"][u] = avatar_url
                 total_tickets = sum(len(tickets[cat]) for cat in tickets) if tickets else 0
                 if active_team != "All Teams" and total_tickets == 0: config["members"][u] = "HIDDEN_NO_TICKETS"
@@ -2010,6 +2044,250 @@ def run_dashboard(config):
     select_dates_btn = ctk.CTkButton(header_row, text="📅 Dates", font=(FONT_FAMILY, 10, "bold"), fg_color=ACCENT_BLUE, hover_color=ACCENT_HOVER, width=60, height=25)
     select_dates_btn.pack(side="left", padx=5)
 
+    # --- 🗓️ SPRINT OVERRIDE BUTTON ---
+    # Shows "🗓️ Sprint ✎" (orange) when a manual sprint is pinned,
+    # or "🗓️ Sprint" (ghost) when using the auto-detected sprint from Jira.
+    def _sprint_override_label():
+        return "🗓️ Sprint ✎" if (config.get("manual_sprint_start") and config.get("manual_sprint_end")) else "🗓️ Sprint"
+    def _sprint_override_color():
+        return ("#fb923c", "#c2410c") if (config.get("manual_sprint_start") and config.get("manual_sprint_end")) else (CARD_BG, BTN_HOVER)
+
+    sprint_override_btn = ctk.CTkButton(
+        header_row, text=_sprint_override_label(), font=(FONT_FAMILY, 10, "bold"),
+        fg_color=_sprint_override_color()[0], hover_color=_sprint_override_color()[1],
+        text_color=TEXT_MAIN, border_width=1, border_color=BORDER_COLOR, width=90, height=25
+    )
+    sprint_override_btn.pack(side="left", padx=5)
+
+    # Inline panel that appears below the header row (same pattern as the
+    # calendar holiday picker) — toggled open/closed by sprint_override_btn.
+    sprint_panel_host = ctk.CTkFrame(app, fg_color="transparent")
+    app.active_sprint_panel = None
+
+    def _sprint_btn_label():
+        return "🗓️ Sprint ✎" if (config.get("pinned_sprint") or config.get("manual_sprint_start")) else "🗓️ Sprint"
+    def _sprint_btn_color():
+        return "#fb923c" if (config.get("pinned_sprint") or config.get("manual_sprint_start")) else CARD_BG
+
+    def _close_sprint_panel():
+        if app.active_sprint_panel:
+            try: app.active_sprint_panel.destroy()
+            except: pass
+            app.active_sprint_panel = None
+        sprint_panel_host.pack_forget()
+
+    def _build_sprint_panel():
+        """Build and show the inline sprint-override panel."""
+        # ── outer card ──────────────────────────────────────────────────────
+        panel = ctk.CTkFrame(sprint_panel_host, fg_color=CARD_BG, corner_radius=12,
+                             border_width=1, border_color=BORDER_COLOR)
+        panel.pack(fill="x", padx=20, pady=6)
+        app.active_sprint_panel = panel
+
+        # ── header row inside panel ─────────────────────────────────────────
+        ph = ctk.CTkFrame(panel, fg_color="transparent")
+        ph.pack(fill="x", padx=14, pady=(10, 6))
+        ctk.CTkLabel(ph, text="🗓️ Sprint Override", font=(FONT_FAMILY, 13, "bold"),
+                     text_color=TEXT_MAIN).pack(side="left")
+
+        def _active_txt():
+            p = config.get("pinned_sprint")
+            if p: return f"📌 {p.get('name','?')}"
+            ms, me = config.get("manual_sprint_start",""), config.get("manual_sprint_end","")
+            if ms and me: return f"✎ {ms[:10]} → {me[:10]}"
+            return "🔄 Auto-detected"
+
+        status_lbl = ctk.CTkLabel(ph, text=_active_txt(), font=(FONT_FAMILY, 11, "bold"),
+                                  text_color="#fb923c" if (config.get("pinned_sprint") or config.get("manual_sprint_start")) else TEXT_MUTED)
+        status_lbl.pack(side="left", padx=12)
+
+        # ── tab bar ─────────────────────────────────────────────────────────
+        tab_bar = ctk.CTkFrame(panel, fg_color=ITEM_BG, corner_radius=8)
+        tab_bar.pack(fill="x", padx=14, pady=(0, 8))
+
+        body = ctk.CTkFrame(panel, fg_color="transparent")
+        body.pack(fill="both", expand=True, padx=14)
+
+        tab_picker_frame = ctk.CTkFrame(body, fg_color="transparent")
+        tab_manual_frame = ctk.CTkFrame(body, fg_color="transparent")
+
+        def _show_tab(tab, active_btn, inactive_btn):
+            tab_picker_frame.pack_forget()
+            tab_manual_frame.pack_forget()
+            tab.pack(fill="both", expand=True)
+            active_btn.configure(fg_color=ACCENT_BLUE, text_color="#ffffff")
+            inactive_btn.configure(fg_color="transparent", text_color=TEXT_MUTED)
+
+        btn_p = ctk.CTkButton(tab_bar, text="🏆 Sprint Picker", height=26,
+                              font=(FONT_FAMILY, 11, "bold"), fg_color=ACCENT_BLUE,
+                              text_color="#ffffff", hover_color=ACCENT_HOVER, corner_radius=6)
+        btn_p.pack(side="left", padx=6, pady=5)
+        btn_m = ctk.CTkButton(tab_bar, text="✎ Manual Dates", height=26,
+                              font=(FONT_FAMILY, 11, "bold"), fg_color="transparent",
+                              text_color=TEXT_MUTED, hover_color=BTN_HOVER, corner_radius=6)
+        btn_m.pack(side="left", pady=5)
+        btn_p.configure(command=lambda: _show_tab(tab_picker_frame, btn_p, btn_m))
+        btn_m.configure(command=lambda: _show_tab(tab_manual_frame, btn_m, btn_p))
+
+        # ── SPRINT PICKER tab ────────────────────────────────────────────────
+        # Search box: type part of a sprint name to filter the list instantly.
+        search_row = ctk.CTkFrame(tab_picker_frame, fg_color="transparent")
+        search_row.pack(fill="x", pady=(6, 4))
+        ctk.CTkLabel(search_row, text="🔍", font=(FONT_FAMILY, 14), text_color=TEXT_MUTED).pack(side="left")
+        search_var = ctk.StringVar()
+        search_entry = ctk.CTkEntry(search_row, placeholder_text="Filter sprints by name…",
+                                    textvariable=search_var, height=28,
+                                    fg_color=ITEM_BG, border_color=BORDER_COLOR,
+                                    text_color=TEXT_MAIN, font=(FONT_FAMILY, 12))
+        search_entry.pack(side="left", fill="x", expand=True, padx=(6, 0))
+        search_entry.focus()
+
+        loading_lbl = ctk.CTkLabel(tab_picker_frame, text="⏳ Loading sprints…",
+                                   font=(FONT_FAMILY, 12), text_color=TEXT_MUTED)
+        loading_lbl.pack(pady=10)
+
+        sprint_scroll = ctk.CTkScrollableFrame(tab_picker_frame, fg_color="transparent", height=180)
+        sprint_scroll.pack(fill="both", expand=True, pady=(0, 6))
+
+        _all_sprints = []   # filled by background fetch below
+
+        def _render_sprint_list(filter_txt=""):
+            """Wipe and redraw the sprint card list, respecting the search filter."""
+            for w in sprint_scroll.winfo_children():
+                w.destroy()
+            visible = [s for s in _all_sprints
+                       if filter_txt.lower() in (s.get("name") or "").lower()]
+            if not visible:
+                ctk.CTkLabel(sprint_scroll, text="No sprints match.",
+                             font=(FONT_FAMILY, 12), text_color=TEXT_MUTED).pack(pady=10)
+                return
+            pinned_id = (config.get("pinned_sprint") or {}).get("id")
+            for sp in visible:
+                is_pinned = sp.get("id") == pinned_id
+                s_date = (sp.get("startDate") or "")[:10]
+                e_date = (sp.get("endDate")   or "")[:10]
+                card = ctk.CTkFrame(sprint_scroll, fg_color=ITEM_BG, corner_radius=8,
+                                    border_width=2 if is_pinned else 1,
+                                    border_color=ACCENT_BLUE if is_pinned else BORDER_COLOR)
+                card.pack(fill="x", pady=3)
+                left = ctk.CTkFrame(card, fg_color="transparent")
+                left.pack(side="left", fill="x", expand=True, padx=10, pady=6)
+                ctk.CTkLabel(left, text=("📌 " if is_pinned else "") + (sp.get("name") or "?"),
+                             font=(FONT_FAMILY, 12, "bold"),
+                             text_color=ACCENT_BLUE if is_pinned else TEXT_MAIN,
+                             anchor="w").pack(anchor="w")
+                ctk.CTkLabel(left, text=f"{s_date} → {e_date}" if s_date else "",
+                             font=(FONT_FAMILY, 11), text_color=TEXT_MUTED, anchor="w").pack(anchor="w")
+                ctk.CTkButton(card, text="✅ Use" if not is_pinned else "✅ Active",
+                              width=70, height=26, font=(FONT_FAMILY, 11, "bold"),
+                              fg_color=ACCENT_BLUE if not is_pinned else "#059669",
+                              hover_color=ACCENT_HOVER,
+                              command=lambda s=sp: _pin_sprint(s)).pack(side="right", padx=10, pady=8)
+
+        def _pin_sprint(sp):
+            config["pinned_sprint"] = sp
+            config.pop("manual_sprint_start", None)
+            config.pop("manual_sprint_end",   None)
+            config.pop("manual_sprint_name",  None)
+            save_config(config)
+            sprint_override_btn.configure(text="🗓️ Sprint ✎", fg_color="#fb923c", hover_color="#c2410c")
+            status_lbl.configure(text=f"📌 {sp.get('name','?')}", text_color="#fb923c")
+            _render_sprint_list(search_var.get())
+            refresh_all_members(); refresh_main()
+
+        # Live-filter as the user types.
+        search_var.trace_add("write", lambda *_: _render_sprint_list(search_var.get()))
+
+        def _load_sprints():
+            sprints = get_all_open_sprints(config)
+            _all_sprints.clear()
+            _all_sprints.extend(sprints)
+            def _done():
+                loading_lbl.pack_forget()
+                _render_sprint_list(search_var.get())
+            panel.after(0, _done)
+
+        threading.Thread(target=_load_sprints, daemon=True).start()
+
+        # ── MANUAL DATES tab ────────────────────────────────────────────────
+        ctk.CTkLabel(tab_manual_frame, text="Enter custom start / end dates",
+                     font=(FONT_FAMILY, 11), text_color=TEXT_MUTED).pack(pady=(10, 6))
+        mform = ctk.CTkFrame(tab_manual_frame, fg_color=ITEM_BG, corner_radius=8,
+                             border_width=1, border_color=BORDER_COLOR)
+        mform.pack(fill="x", pady=4)
+        r1 = ctk.CTkFrame(mform, fg_color="transparent"); r1.pack(fill="x", padx=12, pady=(10, 4))
+        ctk.CTkLabel(r1, text="Start:", font=(FONT_FAMILY, 12, "bold"), text_color=TEXT_MAIN, width=52, anchor="w").pack(side="left")
+        s_entry = ctk.CTkEntry(r1, placeholder_text="YYYY-MM-DD", width=160,
+                               fg_color=CARD_BG, border_color=BORDER_COLOR, text_color=TEXT_MAIN, font=(FONT_FAMILY, 12))
+        s_entry.pack(side="left", padx=(6, 0))
+        ms = config.get("manual_sprint_start","")
+        if ms: s_entry.insert(0, ms[:10])
+        r2 = ctk.CTkFrame(mform, fg_color="transparent"); r2.pack(fill="x", padx=12, pady=(4, 10))
+        ctk.CTkLabel(r2, text="End:", font=(FONT_FAMILY, 12, "bold"), text_color=TEXT_MAIN, width=52, anchor="w").pack(side="left")
+        e_entry = ctk.CTkEntry(r2, placeholder_text="YYYY-MM-DD", width=160,
+                               fg_color=CARD_BG, border_color=BORDER_COLOR, text_color=TEXT_MAIN, font=(FONT_FAMILY, 12))
+        e_entry.pack(side="left", padx=(6, 0))
+        me = config.get("manual_sprint_end","")
+        if me: e_entry.insert(0, me[:10])
+        err_lbl = ctk.CTkLabel(tab_manual_frame, text="", font=(FONT_FAMILY, 11), text_color="#ef4444")
+        err_lbl.pack()
+
+        def _apply_manual():
+            s, e = s_entry.get().strip(), e_entry.get().strip()
+            for v, n in [(s,"Start"),(e,"End")]:
+                try: datetime.strptime(v, "%Y-%m-%d")
+                except: err_lbl.configure(text=f"❌ {n} must be YYYY-MM-DD"); return
+            if s > e: err_lbl.configure(text="❌ Start must be before end"); return
+            config["manual_sprint_start"] = s + "T00:00:00+00:00"
+            config["manual_sprint_end"]   = e + "T23:59:59+00:00"
+            config["manual_sprint_name"]  = f"Manual {s} → {e}"
+            config.pop("pinned_sprint", None)
+            save_config(config)
+            sprint_override_btn.configure(text="🗓️ Sprint ✎", fg_color="#fb923c", hover_color="#c2410c")
+            status_lbl.configure(text=f"✎ {s} → {e}", text_color="#fb923c")
+            refresh_all_members(); refresh_main()
+
+        ctk.CTkButton(tab_manual_frame, text="✅ Apply", width=120, height=28,
+                      font=(FONT_FAMILY, 12, "bold"), fg_color=ACCENT_BLUE,
+                      hover_color=ACCENT_HOVER, command=_apply_manual).pack(pady=8)
+
+        # ── shared Clear button ─────────────────────────────────────────────
+        def _clear():
+            config.pop("pinned_sprint",       None)
+            config.pop("manual_sprint_start", None)
+            config.pop("manual_sprint_end",   None)
+            config.pop("manual_sprint_name",  None)
+            save_config(config)
+            sprint_override_btn.configure(text="🗓️ Sprint", fg_color=CARD_BG, hover_color=BTN_HOVER)
+            status_lbl.configure(text="🔄 Auto-detected", text_color=TEXT_MUTED)
+            _render_sprint_list(search_var.get())
+            refresh_all_members(); refresh_main()
+
+        ctk.CTkButton(panel, text="🗑 Clear — use auto-detected sprint", height=28,
+                      font=(FONT_FAMILY, 11, "bold"), fg_color="transparent",
+                      text_color=TEXT_MUTED, hover_color=BTN_HOVER,
+                      border_width=1, border_color=BORDER_COLOR,
+                      command=_clear).pack(fill="x", padx=14, pady=(4, 12))
+
+        # Start on Sprint Picker tab.
+        _show_tab(tab_picker_frame, btn_p, btn_m)
+
+    def toggle_sprint_panel():
+        if app.active_sprint_panel:
+            _close_sprint_panel()
+            return
+        # Close calendar panel if open (only one inline panel at a time).
+        if app.active_calendar_instance is not None:
+            try: app.active_calendar_instance.destroy()
+            except: pass
+            app.active_calendar_instance = None
+            app.active_calendar_target = None
+            master_layout_panel.pack_forget()
+        sprint_panel_host.pack(fill="x", padx=25, pady=0, before=summary)
+        _build_sprint_panel()
+
+    sprint_override_btn.configure(command=toggle_sprint_panel)
+
     saved_scroll = ctk.CTkScrollableFrame(sprint_container, height=250, orientation="horizontal", fg_color="transparent")
     saved_scroll.pack(fill="x", padx=0, pady=(0, 5))
 
@@ -2083,7 +2361,7 @@ def run_dashboard(config):
             refresh_saved_list()
             
             def recalculate():
-                sprint = get_current_sprint(config)
+                sprint = get_effective_sprint(config)
                 config.setdefault("member_avatars", {})
                 tickets, _, logged, avatar_url = get_jira_data(config, u, force_team_filter=active_team)
                 if avatar_url and isinstance(avatar_url, str): config["member_avatars"][u] = avatar_url
@@ -2243,7 +2521,7 @@ def run_dashboard(config):
 
     def refresh_all_members():
         if "members" not in config or not config["members"]: return
-        sprint = get_current_sprint(config)
+        sprint = get_effective_sprint(config)
         def sync():
             active_team = config.get("selected_team", "All Teams")
             if "members_j1" not in config: config["members_j1"] = {}
@@ -2353,7 +2631,7 @@ def run_dashboard(config):
                 app.after(0, lambda: render_main_ui(tickets, totals, logged or 0))
         def render_main_ui(tickets, totals, logged):
             for w in main_scroll.winfo_children(): w.destroy()
-            sprint = get_current_sprint(config)
+            sprint = get_effective_sprint(config)
             logged = logged or 0
             my_dedication = config.get("dedication", 1.0)
             holiday_seconds = calculate_holiday_subtraction_seconds(sprint["startDate"] if sprint else None, config.get("holiday_dates", []))
