@@ -8,7 +8,6 @@ WORK_START = 9
 WORK_END = 17
 REFRESH_INTERVAL = 300000  # ms -> 5 minutes; passed to app.after() for dashboard auto-refresh
 ALERT_TIMES = ["11:00", "16:00"]  # daily logging-reminder notification times (24h "HH:MM")
-
 # Fallback only: used when the app can't reach Jira yet (e.g. first ever
 # launch, offline). Once it successfully talks to Jira, main.py discovers
 # the REAL, current list of teams directly from ticket data via
