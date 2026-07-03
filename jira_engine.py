@@ -52,6 +52,114 @@ def format_time(seconds):
     if minutes > 0: parts.append(f"{minutes}m")
     return " ".join(parts) if parts else "0m"
 
+def get_available_projects(config):
+    """
+    Fetch every Jira project this account can see, for the project-selection
+    step shown at login (and reachable later from dashboard settings).
+    Returns a list of {"key": ..., "name": ...} dicts sorted by name, or []
+    on failure (caller should treat that as "skip project selection").
+    """
+    try:
+        res = requests.get(
+            f"https://{DOMAIN}/rest/api/2/project",
+            auth=HTTPBasicAuth(config["user"], config["token"]),
+            timeout=15
+        )
+        if res.status_code != 200:
+            return []
+        projects = res.json()
+        out = [{"key": p.get("key"), "name": p.get("name") or p.get("key")}
+               for p in projects if p.get("key")]
+        return sorted(out, key=lambda p: p["name"].lower())
+    except Exception as e:
+        print(f"[get_available_projects] Error: {e}")
+        return []
+
+
+# Preserves old behavior for configs saved before project selection existed.
+_DEFAULT_PROJECT_KEY = "SytProjectMgt"
+
+
+def _project_clause(config):
+    """
+    Build the JQL project filter from the project(s) the user picked at
+    login / in Settings, instead of the single project that used to be
+    hardcoded into every query here. Scoping to only the project(s) someone
+    actually works on means Jira has far fewer tickets to search per
+    request.
+    """
+    projects = config.get("selected_projects") or [_DEFAULT_PROJECT_KEY]
+    if len(projects) == 1:
+        return f"project = {projects[0]}"
+    return "project in (%s)" % ", ".join(projects)
+
+
+def get_available_te_projects(config):
+    """
+    Discover the distinct 'TE-Project' (sub-project) values present on
+    tickets within the currently selected project(s) right now — 'TE-Project'
+    is a custom field some Jira projects use to further divide a project
+    into sub-projects. Shown as a second selection step right after picking
+    Project(s) at login (and reachable later from Settings).
+
+    Scope: tickets in the currently open sprint within the already-selected
+    project(s) — same scope used by get_all_teams — so the list only shows
+    sub-projects actually in use right now, and needs no code change when a
+    new one appears.
+
+    Returns: sorted list of TE-Project values, or [] if the field isn't
+    configured on this Jira instance, nothing is found, or the request
+    fails — callers should treat that as "skip this selection step".
+    """
+    field_id = get_te_project_field_id(config)
+    if not field_id:
+        return []
+
+    jql = f"sprint in openSprints() AND {_project_clause(config)}"
+    try:
+        values_found = set()
+        all_issues, start_at, page = [], 0, 100
+        while True:
+            resp = requests.get(
+                f"https://{DOMAIN}/rest/api/2/search",
+                params={"jql": jql, "fields": field_id, "maxResults": page, "startAt": start_at},
+                auth=HTTPBasicAuth(config["user"], config["token"]),
+                timeout=20
+            ).json()
+            batch = resp.get("issues", [])
+            all_issues.extend(batch)
+            if len(batch) < page:
+                break
+            start_at += page
+
+        for issue in all_issues:
+            raw = issue.get("fields", {}).get(field_id)
+            value = _extract_field_value(raw)
+            if value and value != "N/A":
+                values_found.add(value.strip())
+
+        return sorted(values_found, key=str.lower)
+    except Exception as e:
+        print(f"[get_available_te_projects] Error: {e}")
+        return []
+
+
+def _te_project_clause(config):
+    """
+    Optional JQL filter for the 'TE-Project' sub-project field, layered on
+    top of _project_clause() — narrowing by TE-Project shrinks the ticket
+    set further, on top of the project-level scope. Unlike project, this is
+    optional: an empty/absent selection means "all sub-projects" and adds
+    no filter at all, so behavior for configs saved before this feature
+    existed (or users who skip it) is unaffected.
+    """
+    values = config.get("selected_te_projects")
+    if not values:
+        return ""
+    quoted = ", ".join(f'"{v}"' for v in values)
+    return f' AND "TE-Project" in ({quoted})'
+
+
 def get_user_identity(config, username=None):
     url = (f"https://{DOMAIN}/rest/api/2/myself" if not username
            else f"https://{DOMAIN}/rest/api/2/user/search?username={username}")
@@ -377,6 +485,9 @@ def get_achieved_reqs_field_id(config):
 def get_achieved_tickets_field_id(config):
     return _get_field_id(config, "Achieved Tickets", "achieved_tickets_field_id")
 
+def get_te_project_field_id(config):
+    return _get_field_id(config, "TE-Project", "te_project_field_id", case_insensitive=True)
+
 # ── team-name matching ─────────────────────────────────────────────────────
 
 def _team_matches(team_name, field_value, ticket_key):
@@ -448,7 +559,7 @@ def get_team_overview_and_logging(config, team_name):
     achieved_reqs_id     = get_achieved_reqs_field_id(config)
     achieved_tickets_id  = get_achieved_tickets_field_id(config)
 
-    jql = "sprint in openSprints() AND issuetype = 'Task' AND project = SytProjectMgt"
+    jql = f"sprint in openSprints() AND issuetype = 'Task' AND {_project_clause(config)}{_te_project_clause(config)}"
     fields = "summary,timeoriginalestimate,timeestimate,status,worklog,assignee"
     if team_field_id:       fields += f",{team_field_id}"
     if custom_labels_id:    fields += f",{custom_labels_id}"
@@ -602,7 +713,7 @@ def get_all_teams(config):
     if not team_field_id:
         return ["All Teams"]
 
-    jql = "sprint in openSprints() AND issuetype = 'Task' AND project = SytProjectMgt"
+    jql = f"sprint in openSprints() AND issuetype = 'Task' AND {_project_clause(config)}{_te_project_clause(config)}"
 
     try:
         teams_found = set()
@@ -639,9 +750,9 @@ def get_jira_data(config, target_username=None, force_team_filter=None):
         return None, None, None, False
 
     search_user = f"'{target_username}'" if target_username else "currentUser()"
-    jql = f"assignee={search_user} AND sprint in openSprints()"
+    jql = f"assignee={search_user} AND sprint in openSprints() AND {_project_clause(config)}{_te_project_clause(config)}"
     if target_username:
-        jql += " AND issuetype = 'Task'AND project = SytProjectMgt"
+        jql += " AND issuetype = 'Task'"
 
     team_field_id        = get_team_field_name(config)
     custom_labels_id     = get_custom_labels_field_name(config)
