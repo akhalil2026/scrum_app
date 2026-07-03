@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 from tkinter import filedialog, messagebox
 from PIL import Image
 from config import load_config, save_config, clear_config, TEAMS_LIST, REFRESH_INTERVAL , HOURS_PER_DAY 
-from jira_engine import get_jira_data, get_team_overview_data, get_team_member_logging, get_current_sprint, get_all_open_sprints, calculate_expected_hours, calculate_expected_hours_j1, format_time, get_user_identity, get_achieved_tcs_field_id, get_achieved_reqs_field_id, get_achieved_tickets_field_id, get_ticket_checklist, get_all_teams
+from jira_engine import get_jira_data, get_team_overview_data, get_team_member_logging, get_current_sprint, get_all_open_sprints, calculate_expected_hours, calculate_expected_hours_j1, format_time, get_user_identity, get_available_projects, get_available_te_projects, get_achieved_tcs_field_id, get_achieved_reqs_field_id, get_achieved_tickets_field_id, get_ticket_checklist, get_all_teams
 from notifications import start_scheduler
 
 # =========================================================
@@ -21,6 +21,20 @@ from notifications import start_scheduler
 # =========================================================
 _checklist_cache = {}
 _checklist_cache_lock = threading.Lock()
+
+def _position_over_parent(win, parent, width, height):
+    """Place a CTkToplevel centered over `parent`, so popups always open on
+    whichever monitor the main window currently sits on, instead of Tk's
+    default placement (which can land on a different monitor)."""
+    try:
+        parent.update_idletasks()
+        px, py = parent.winfo_x(), parent.winfo_y()
+        pw, ph = parent.winfo_width(), parent.winfo_height()
+        x = px + max(0, (pw - width) // 2)
+        y = py + max(0, (ph - height) // 2)
+        win.geometry(f"{width}x{height}+{x}+{y}")
+    except Exception:
+        win.geometry(f"{width}x{height}")
 
 def _ticket_has_checklist(config, ticket_key):
     """Return True/False for whether ticket_key has a to-do/checklist, using the cache."""
@@ -263,9 +277,12 @@ class EmbeddedCalendarSelector(ctk.CTkFrame):
     def save_and_close(self):
         self.on_save_callback(sorted(list(self.selected_dates)))
 
-def open_member_dashboard(config, username):
-    win = ctk.CTkToplevel()
-    win.geometry("1050x750")  
+def open_member_dashboard(config, username, parent=None):
+    win = ctk.CTkToplevel(parent)
+    if parent:
+        _position_over_parent(win, parent, 1050, 750)
+    else:
+        win.geometry("1050x750")
     win.title(f"Team Member Details: {username}")
     win.configure(fg_color=APP_BG)
     win.attributes('-topmost', True)
@@ -342,7 +359,7 @@ def open_ticket_checklist_window(config, parent, ticket_key, link):
     ('To Do List: X/Y resolved'), fetched live and rendered read-only.
     """
     win = ctk.CTkToplevel(parent)
-    win.geometry("520x600")
+    _position_over_parent(win, parent, 520, 600)
     win.title(f"To Do List — {ticket_key}")
     win.configure(fg_color=APP_BG)
     win.attributes('-topmost', True)
@@ -392,9 +409,12 @@ def open_ticket_checklist_window(config, parent, ticket_key, link):
 
     threading.Thread(target=load, daemon=True).start()
 
-def open_team_tickets_dashboard(config):
-    win = ctk.CTkToplevel()
-    win.geometry("1150x850")
+def open_team_tickets_dashboard(config, parent=None):
+    win = ctk.CTkToplevel(parent)
+    if parent:
+        _position_over_parent(win, parent, 1150, 850)
+    else:
+        win.geometry("1150x850")
     win.title("Global Tracked Team Tickets Lane Overview")
     win.configure(fg_color=APP_BG)
     win.attributes('-topmost', True)
@@ -907,9 +927,12 @@ def open_team_tickets_dashboard(config):
     win.protocol("WM_DELETE_WINDOW", cleanup_window)
     threading.Thread(target=fetch_all_team_data, daemon=True).start()
 
-def open_teams_overview_dashboard(config):
-    win = ctk.CTkToplevel()
-    win.geometry("1150x920")
+def open_teams_overview_dashboard(config, parent=None):
+    win = ctk.CTkToplevel(parent)
+    if parent:
+        _position_over_parent(win, parent, 1150, 920)
+    else:
+        win.geometry("1150x920")
     win.title("Teams Overview — Sprint Tickets by Team")
     win.configure(fg_color=APP_BG)
     win.attributes('-topmost', True)
@@ -1741,7 +1764,7 @@ def run_dashboard(config):
         if not u: return
         
         pop = ctk.CTkToplevel(app)
-        pop.geometry("320x180")
+        _position_over_parent(pop, app, 320, 180)
         pop.title("Capacity Metric")
         pop.configure(fg_color=CARD_BG)
         pop.attributes('-topmost', True)
@@ -1892,7 +1915,7 @@ def run_dashboard(config):
     def open_add_teams_modal():
         """Open modal to select team and add members"""
         modal = ctk.CTkToplevel(app)
-        modal.geometry("500x500")
+        _position_over_parent(modal, app, 500, 500)
         modal.title("Add Team Members")
         modal.configure(fg_color=APP_BG)
         modal.attributes('-topmost', True)
@@ -2333,7 +2356,7 @@ def run_dashboard(config):
 
     def change_member_dedication(u):
         pop = ctk.CTkToplevel(app)
-        pop.geometry("340x200")
+        _position_over_parent(pop, app, 340, 200)
         pop.title("Capacity Metric")
         pop.configure(fg_color=CARD_BG)
         pop.attributes('-topmost', True)
@@ -2514,7 +2537,7 @@ def run_dashboard(config):
             
             btn_row = ctk.CTkFrame(card, fg_color="transparent")
             btn_row.pack(fill="x", padx=15, side="bottom", pady=(0, 8))
-            ctk.CTkButton(btn_row, text="View Tickets", height=24, font=(FONT_FAMILY, 11, "bold"), fg_color=ACCENT_BLUE, hover_color=ACCENT_HOVER, command=lambda u=user: open_member_dashboard(config, u)).pack(fill="x", pady=(0, 4))
+            ctk.CTkButton(btn_row, text="View Tickets", height=24, font=(FONT_FAMILY, 11, "bold"), fg_color=ACCENT_BLUE, hover_color=ACCENT_HOVER, command=lambda u=user: open_member_dashboard(config, u, app)).pack(fill="x", pady=(0, 4))
             ctk.CTkButton(btn_row, text="Change dedication", height=24, font=(FONT_FAMILY, 11, "bold"), fg_color=ACCENT_BLUE, hover_color=ACCENT_HOVER, command=lambda u=user: change_member_dedication(u)).pack(fill="x")
             
             active_card_widgets[user] = {"frame": card, "dedication_lbl": dedication_lbl, "badge_frame": badge, "status_lbl": status_lbl, "j1_badge_frame": j1_badge, "j1_lbl": j1_lbl}
@@ -2588,9 +2611,180 @@ def run_dashboard(config):
         except Exception as e: messagebox.showerror("Import Error", f"Failed to parse: {str(e)}")
 
     
+    def open_project_settings():
+        """
+        Lets the user change which Jira project(s) the whole app is scoped
+        to, without having to log out. Every ticket/team query is filtered
+        by config['selected_projects'] (see jira_engine._project_clause).
+        Includes a live search box since some Jira instances have a lot of
+        projects.
+        """
+        modal = ctk.CTkToplevel(app)
+        modal.title("Select Projects")
+        _position_over_parent(modal, app, 380, 560)
+        modal.configure(fg_color=APP_BG)
+        modal.transient(app)
+        modal.grab_set()
+
+        ctk.CTkLabel(modal, text="Select Your Project(s)", font=(FONT_FAMILY, 16, "bold"), text_color=TEXT_MAIN).pack(pady=(20, 5))
+        ctk.CTkLabel(modal, text="Only tickets in the projects you pick are fetched.\nFewer projects = a faster app.",
+                     font=(FONT_FAMILY, 11), text_color=TEXT_MUTED, justify="center").pack(pady=(0, 10))
+
+        loading_lbl = ctk.CTkLabel(modal, text="⏳ Loading projects…", font=(FONT_FAMILY, 11, "italic"), text_color=TEXT_MUTED)
+        loading_lbl.pack(pady=20)
+
+        search_e = ctk.CTkEntry(modal, placeholder_text="🔍 Search projects...", width=320, height=32,
+                                 fg_color=ITEM_BG, border_color=BORDER_COLOR, font=(FONT_FAMILY, 12), text_color=TEXT_MAIN)
+        proj_scroll = ctk.CTkScrollableFrame(modal, fg_color=ITEM_BG, width=320, height=280)
+        check_vars = {}
+        warn_lbl = ctk.CTkLabel(modal, text="", font=(FONT_FAMILY, 11), text_color="#ef4444")
+        all_projects_ref = {"value": []}
+
+        def render_list(filter_text=""):
+            for w in proj_scroll.winfo_children(): w.destroy()
+            needle = filter_text.strip().lower()
+            shown = [p for p in all_projects_ref["value"] if not needle
+                     or needle in p["name"].lower() or needle in p["key"].lower()]
+            if not shown:
+                ctk.CTkLabel(proj_scroll, text="No matching projects.", font=(FONT_FAMILY, 12), text_color=TEXT_MUTED).pack(pady=10)
+                return
+            for p in shown:
+                ctk.CTkCheckBox(proj_scroll, text=f"{p['name']} ({p['key']})", variable=check_vars[p["key"]],
+                                font=(FONT_FAMILY, 12), text_color=TEXT_MAIN,
+                                checkbox_width=18, checkbox_height=18, border_width=1,
+                                hover_color=BTN_HOVER, fg_color=ACCENT_BLUE).pack(anchor="w", padx=10, pady=4)
+
+        def build_list(projects):
+            loading_lbl.destroy()
+            search_e.pack(pady=(0, 10))
+            search_e.bind("<KeyRelease>", lambda e: render_list(search_e.get()))
+            proj_scroll.pack(pady=10, padx=15, fill="both", expand=True)
+            current = set(config.get("selected_projects") or [])
+            # Currently-selected projects first (still alphabetical within
+            # each group), so on reopen you immediately see what's active
+            # instead of having to scan the whole alphabetical list for checks.
+            ordered = sorted(projects, key=lambda p: (p["key"] not in current, p["name"].lower()))
+            all_projects_ref["value"] = ordered
+            for p in ordered:
+                check_vars[p["key"]] = ctk.BooleanVar(value=(p["key"] in current))
+            render_list()
+            warn_lbl.pack()
+            save_btn.pack(pady=15)
+
+        def load():
+            projects = get_available_projects(config)
+            if not projects:
+                modal.after(0, lambda: loading_lbl.configure(text="⚠️ Could not load project list."))
+                return
+            modal.after(0, lambda: build_list(projects))
+        threading.Thread(target=load, daemon=True).start()
+
+        def save_and_close():
+            selected = [key for key, var in check_vars.items() if var.get()]
+            if not selected:
+                warn_lbl.configure(text="Pick at least one project.")
+                return
+            config["selected_projects"] = selected
+            save_config(config)
+            modal.destroy()
+
+            # Team names, tickets, and member logging can all differ under
+            # the new project scope, so refresh everything: the dynamic team
+            # list first (so the filter reflects the new project's teams),
+            # then the actual data.
+            def after_teams_refreshed():
+                selected_teams["value"] = set(get_teams_list(config))
+                refresh_saved_list()
+            _refresh_teams_list_async(config, on_done=lambda: app.after(0, after_teams_refreshed))
+            refresh_all_members()
+            refresh_main()
+
+        save_btn = ctk.CTkButton(modal, text="Save & Refresh", font=(FONT_FAMILY, 13, "bold"),
+                                  fg_color=ACCENT_BLUE, hover_color=ACCENT_HOVER, command=save_and_close)
+
+    def open_te_project_settings():
+        """
+        Lets the user change which 'TE-Project' sub-project value(s) the app
+        is further scoped to, on top of the selected Project(s). Optional —
+        leaving everything unchecked means "all sub-projects" (no filter).
+        """
+        modal = ctk.CTkToplevel(app)
+        modal.title("Select TE-Projects")
+        _position_over_parent(modal, app, 380, 560)
+        modal.configure(fg_color=APP_BG)
+        modal.transient(app)
+        modal.grab_set()
+
+        ctk.CTkLabel(modal, text="Select TE-Project(s)", font=(FONT_FAMILY, 16, "bold"), text_color=TEXT_MAIN).pack(pady=(20, 5))
+        ctk.CTkLabel(modal, text="Optional: narrow further by sub-project.\nLeave everything unchecked to include all.",
+                     font=(FONT_FAMILY, 11), text_color=TEXT_MUTED, justify="center").pack(pady=(0, 10))
+
+        loading_lbl = ctk.CTkLabel(modal, text="⏳ Loading TE-Projects…", font=(FONT_FAMILY, 11, "italic"), text_color=TEXT_MUTED)
+        loading_lbl.pack(pady=20)
+
+        search_e = ctk.CTkEntry(modal, placeholder_text="🔍 Search TE-Projects...", width=320, height=32,
+                                 fg_color=ITEM_BG, border_color=BORDER_COLOR, font=(FONT_FAMILY, 12), text_color=TEXT_MAIN)
+        te_scroll = ctk.CTkScrollableFrame(modal, fg_color=ITEM_BG, width=320, height=280)
+        check_vars = {}
+        all_te_ref = {"value": []}
+
+        def render_list(filter_text=""):
+            for w in te_scroll.winfo_children(): w.destroy()
+            needle = filter_text.strip().lower()
+            shown = [v for v in all_te_ref["value"] if not needle or needle in v.lower()]
+            if not shown:
+                ctk.CTkLabel(te_scroll, text="No matching TE-Projects.", font=(FONT_FAMILY, 12), text_color=TEXT_MUTED).pack(pady=10)
+                return
+            for v in shown:
+                ctk.CTkCheckBox(te_scroll, text=v, variable=check_vars[v],
+                                font=(FONT_FAMILY, 12), text_color=TEXT_MAIN,
+                                checkbox_width=18, checkbox_height=18, border_width=1,
+                                hover_color=BTN_HOVER, fg_color=ACCENT_BLUE).pack(anchor="w", padx=10, pady=4)
+
+        def build_list(te_projects):
+            loading_lbl.destroy()
+            search_e.pack(pady=(0, 10))
+            search_e.bind("<KeyRelease>", lambda e: render_list(search_e.get()))
+            te_scroll.pack(pady=10, padx=15, fill="both", expand=True)
+            current = set(config.get("selected_te_projects") or [])
+            # Currently-selected values first, same as the Projects modal.
+            ordered = sorted(te_projects, key=lambda v: (v not in current, v.lower()))
+            all_te_ref["value"] = ordered
+            for v in ordered:
+                check_vars[v] = ctk.BooleanVar(value=(v in current))
+            render_list()
+            save_btn.pack(pady=15)
+
+        def load():
+            te_projects = get_available_te_projects(config)
+            if not te_projects:
+                modal.after(0, lambda: loading_lbl.configure(
+                    text="⚠️ No TE-Project field/values found\nfor the currently selected project(s)."))
+                return
+            modal.after(0, lambda: build_list(te_projects))
+        threading.Thread(target=load, daemon=True).start()
+
+        def save_and_close():
+            selected = [v for v, var in check_vars.items() if var.get()]
+            config["selected_te_projects"] = selected  # may be [] — valid: "all"
+            save_config(config)
+            modal.destroy()
+
+            def after_teams_refreshed():
+                selected_teams["value"] = set(get_teams_list(config))
+                refresh_saved_list()
+            _refresh_teams_list_async(config, on_done=lambda: app.after(0, after_teams_refreshed))
+            refresh_all_members()
+            refresh_main()
+
+        save_btn = ctk.CTkButton(modal, text="Save & Refresh", font=(FONT_FAMILY, 13, "bold"),
+                                  fg_color=ACCENT_BLUE, hover_color=ACCENT_HOVER, command=save_and_close)
+
+    ctk.CTkButton(controls_frame, text="🧩 TE-Project", width=110, height=28, font=(FONT_FAMILY, 12, "bold"), fg_color=CARD_BG, hover_color=BTN_HOVER, text_color=TEXT_MAIN, border_width=1, border_color=BORDER_COLOR, command=open_te_project_settings).pack(side="right", padx=(15, 0))
+    ctk.CTkButton(controls_frame, text="🗂 Projects", width=100, height=28, font=(FONT_FAMILY, 12, "bold"), fg_color=CARD_BG, hover_color=BTN_HOVER, text_color=TEXT_MAIN, border_width=1, border_color=BORDER_COLOR, command=open_project_settings).pack(side="right", padx=(15, 0))
     ctk.CTkButton(controls_frame, text="🔄 Refresh Team", width=120, height=28, font=(FONT_FAMILY, 12, "bold"), fg_color=CARD_BG, hover_color=BTN_HOVER, text_color=TEXT_MAIN, border_width=1, border_color=BORDER_COLOR, command=lambda: (_refresh_teams_list_async(config), refresh_all_members(), refresh_main())).pack(side="right", padx=(15, 0))
-    ctk.CTkButton(controls_frame, text="📋 Team Tickets", width=120, height=28, font=(FONT_FAMILY, 12, "bold"), fg_color=CARD_BG, hover_color=BTN_HOVER, text_color=TEXT_MAIN, border_width=1, border_color=BORDER_COLOR, command=lambda: open_team_tickets_dashboard(config)).pack(side="right", padx=(15, 0))
-    ctk.CTkButton(controls_frame, text="🏢 Teams Overview", width=135, height=28, font=(FONT_FAMILY, 12, "bold"), fg_color=CARD_BG, hover_color=BTN_HOVER, text_color=TEXT_MAIN, border_width=1, border_color=BORDER_COLOR, command=lambda: open_teams_overview_dashboard(config)).pack(side="right", padx=(15, 0))
+    ctk.CTkButton(controls_frame, text="📋 Team Tickets", width=120, height=28, font=(FONT_FAMILY, 12, "bold"), fg_color=CARD_BG, hover_color=BTN_HOVER, text_color=TEXT_MAIN, border_width=1, border_color=BORDER_COLOR, command=lambda: open_team_tickets_dashboard(config, app)).pack(side="right", padx=(15, 0))
+    ctk.CTkButton(controls_frame, text="🏢 Teams Overview", width=135, height=28, font=(FONT_FAMILY, 12, "bold"), fg_color=CARD_BG, hover_color=BTN_HOVER, text_color=TEXT_MAIN, border_width=1, border_color=BORDER_COLOR, command=lambda: open_teams_overview_dashboard(config, app)).pack(side="right", padx=(15, 0))
     ctk.CTkButton(controls_frame, text="📤 Export Team", width=110, height=28, font=(FONT_FAMILY, 12, "bold"), fg_color=CARD_BG, hover_color=BTN_HOVER, text_color=TEXT_MAIN, border_width=1, border_color=BORDER_COLOR, command=export_team_data).pack(side="right", padx=(15, 0))
     ctk.CTkButton(controls_frame, text="📥 Import Team", width=110, height=28, font=(FONT_FAMILY, 12, "bold"), fg_color=CARD_BG, hover_color=BTN_HOVER, text_color=TEXT_MAIN, border_width=1, border_color=BORDER_COLOR, command=import_team_data).pack(side="right", padx=(15, 0))
 
@@ -2779,9 +2973,18 @@ def show_login():
             identity = get_user_identity(cfg)
             
             if identity and "error" not in identity:
-                save_config(cfg)
-                login_status["cfg"] = cfg
-                app.after(0, app.destroy)
+                # Fetch the project list now, on this background thread, so
+                # the selection screen below never blocks the UI waiting on it.
+                projects = get_available_projects(cfg)
+                if projects:
+                    app.after(0, lambda: show_project_selection(cfg, projects))
+                else:
+                    # No projects came back (older Jira instance, permissions,
+                    # or a transient error) — don't block login on this. Falls
+                    # back to the original hardcoded project automatically.
+                    save_config(cfg)
+                    login_status["cfg"] = cfg
+                    app.after(0, app.destroy)
             elif identity and identity.get("error") == "CAPTCHA_CHALLENGE":
                 app.after(0, lambda: messagebox.showerror(
                     "Jira Security Lockout", 
@@ -2795,6 +2998,126 @@ def show_login():
                 app.after(0, lambda: submit_btn.configure(state="normal", text="Initialize Gateway Connection"))
 
         threading.Thread(target=verify_credentials_thread, daemon=True).start()
+
+    def show_project_selection(cfg, projects):
+        """
+        Second login step: pick one or more Jira projects to work with.
+        Everything downstream (tickets, teams, sprints) is then scoped to
+        just these projects — picking fewer means fewer tickets for Jira to
+        search on every request. A search box filters the list live since
+        some Jira instances have dozens/hundreds of projects.
+        """
+        for w in frame.winfo_children(): w.destroy()
+        app.geometry("440x640")
+
+        ctk.CTkLabel(frame, text="Select Your Project(s)", font=(FONT_FAMILY, 22, "bold"), text_color=TEXT_MAIN).pack(pady=(30, 5))
+        ctk.CTkLabel(frame, text="Only tickets in the projects you pick will be\nfetched. Fewer projects = a faster app.",
+                     font=(FONT_FAMILY, 12), text_color=TEXT_MUTED, justify="center").pack(pady=(0, 12))
+
+        search_e = ctk.CTkEntry(frame, placeholder_text="🔍 Search projects...", width=320, height=34,
+                                 fg_color=ITEM_BG, border_color=BORDER_COLOR, font=(FONT_FAMILY, 13), text_color=TEXT_MAIN)
+        search_e.pack(pady=(0, 10))
+
+        proj_scroll = ctk.CTkScrollableFrame(frame, fg_color=ITEM_BG, width=320, height=260)
+        proj_scroll.pack(pady=5, padx=20, fill="both", expand=True)
+
+        # One BooleanVar per project, created once up front — filtering only
+        # changes which checkboxes are shown, never recreates the vars, so a
+        # selection made before searching isn't lost when the search clears.
+        check_vars = {p["key"]: ctk.BooleanVar(value=False) for p in projects}
+
+        def render_list(filter_text=""):
+            for w in proj_scroll.winfo_children(): w.destroy()
+            needle = filter_text.strip().lower()
+            shown = [p for p in projects if not needle
+                     or needle in p["name"].lower() or needle in p["key"].lower()]
+            if not shown:
+                ctk.CTkLabel(proj_scroll, text="No matching projects.", font=(FONT_FAMILY, 12), text_color=TEXT_MUTED).pack(pady=10)
+                return
+            for p in shown:
+                ctk.CTkCheckBox(proj_scroll, text=f"{p['name']} ({p['key']})", variable=check_vars[p["key"]],
+                                font=(FONT_FAMILY, 12), text_color=TEXT_MAIN,
+                                checkbox_width=18, checkbox_height=18, border_width=1,
+                                hover_color=BTN_HOVER, fg_color=ACCENT_BLUE).pack(anchor="w", padx=10, pady=4)
+
+        search_e.bind("<KeyRelease>", lambda e: render_list(search_e.get()))
+        render_list()
+
+        warn_lbl = ctk.CTkLabel(frame, text="", font=(FONT_FAMILY, 11), text_color="#ef4444")
+        warn_lbl.pack()
+
+        def finish():
+            selected = [key for key, var in check_vars.items() if var.get()]
+            if not selected:
+                warn_lbl.configure(text="Pick at least one project to continue.")
+                return
+            cfg["selected_projects"] = selected
+            save_config(cfg)
+
+            # Third step (optional): narrow by TE-Project sub-project, if
+            # that field exists and has values within the project(s) just
+            # picked. Fetching happens off the UI thread so this doesn't
+            # freeze the "Continue" click.
+            def fetch_te_projects():
+                te_projects = get_available_te_projects(cfg)
+                if te_projects:
+                    app.after(0, lambda: show_te_project_selection(cfg, te_projects))
+                else:
+                    login_status["cfg"] = cfg
+                    app.after(0, app.destroy)
+            threading.Thread(target=fetch_te_projects, daemon=True).start()
+
+        ctk.CTkButton(frame, text="Continue", font=(FONT_FAMILY, 13, "bold"), width=280, height=40,
+                      fg_color=ACCENT_BLUE, hover_color=ACCENT_HOVER, command=finish).pack(pady=20)
+
+    def show_te_project_selection(cfg, te_projects):
+        """
+        Third, optional login step: narrow further by 'TE-Project' — a
+        custom field some Jira projects use to divide a project into
+        sub-projects. Unlike project selection, picking nothing here is
+        valid and means "all sub-projects" (no extra filter applied).
+        """
+        for w in frame.winfo_children(): w.destroy()
+        app.geometry("440x640")
+
+        ctk.CTkLabel(frame, text="Select TE-Project(s)", font=(FONT_FAMILY, 22, "bold"), text_color=TEXT_MAIN).pack(pady=(30, 5))
+        ctk.CTkLabel(frame, text="Optional: narrow further by sub-project.\nLeave everything unchecked to include all.",
+                     font=(FONT_FAMILY, 12), text_color=TEXT_MUTED, justify="center").pack(pady=(0, 12))
+
+        search_e = ctk.CTkEntry(frame, placeholder_text="🔍 Search TE-Projects...", width=320, height=34,
+                                 fg_color=ITEM_BG, border_color=BORDER_COLOR, font=(FONT_FAMILY, 13), text_color=TEXT_MAIN)
+        search_e.pack(pady=(0, 10))
+
+        te_scroll = ctk.CTkScrollableFrame(frame, fg_color=ITEM_BG, width=320, height=260)
+        te_scroll.pack(pady=5, padx=20, fill="both", expand=True)
+
+        check_vars = {v: ctk.BooleanVar(value=False) for v in te_projects}
+
+        def render_list(filter_text=""):
+            for w in te_scroll.winfo_children(): w.destroy()
+            needle = filter_text.strip().lower()
+            shown = [v for v in te_projects if not needle or needle in v.lower()]
+            if not shown:
+                ctk.CTkLabel(te_scroll, text="No matching TE-Projects.", font=(FONT_FAMILY, 12), text_color=TEXT_MUTED).pack(pady=10)
+                return
+            for v in shown:
+                ctk.CTkCheckBox(te_scroll, text=v, variable=check_vars[v],
+                                font=(FONT_FAMILY, 12), text_color=TEXT_MAIN,
+                                checkbox_width=18, checkbox_height=18, border_width=1,
+                                hover_color=BTN_HOVER, fg_color=ACCENT_BLUE).pack(anchor="w", padx=10, pady=4)
+
+        search_e.bind("<KeyRelease>", lambda e: render_list(search_e.get()))
+        render_list()
+
+        def finish():
+            selected = [v for v, var in check_vars.items() if var.get()]
+            cfg["selected_te_projects"] = selected  # may be [] — that's valid: "all"
+            save_config(cfg)
+            login_status["cfg"] = cfg
+            app.destroy()
+
+        ctk.CTkButton(frame, text="Continue", font=(FONT_FAMILY, 13, "bold"), width=280, height=40,
+                      fg_color=ACCENT_BLUE, hover_color=ACCENT_HOVER, command=finish).pack(pady=20)
         
     submit_btn = ctk.CTkButton(frame, text="Confirm", font=(FONT_FAMILY, 13, "bold"), width=280, height=40, fg_color=ACCENT_BLUE, hover_color=ACCENT_HOVER, command=do_login)
     submit_btn.pack(pady=25)
