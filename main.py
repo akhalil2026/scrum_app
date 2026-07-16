@@ -5,12 +5,13 @@ import urllib.request
 import io
 import json
 import calendar
+import re
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from tkinter import filedialog, messagebox
 from PIL import Image
 from config import load_config, save_config, clear_config, TEAMS_LIST, REFRESH_INTERVAL , HOURS_PER_DAY 
-from jira_engine import get_jira_data, get_team_overview_data, get_team_member_logging, get_current_sprint, get_all_open_sprints, calculate_expected_hours, calculate_expected_hours_j1, format_time, get_user_identity, get_available_projects, get_available_te_projects, get_achieved_tcs_field_id, get_achieved_reqs_field_id, get_achieved_tickets_field_id, get_ticket_checklist, get_all_teams
+from jira_engine import get_jira_data, get_team_overview_data, get_team_member_logging, get_current_sprint, get_all_open_sprints, get_closed_sprints, get_sprint_member_logging, calculate_expected_hours, calculate_expected_hours_j1, calculate_expected_hours_for_sprint, format_time, get_user_identity, get_available_projects, get_available_te_projects, get_achieved_tcs_field_id, get_achieved_reqs_field_id, get_achieved_tickets_field_id, get_ticket_checklist, get_all_teams, get_my_team_open_tickets
 from notifications import start_scheduler
 
 # =========================================================
@@ -35,6 +36,53 @@ def _position_over_parent(win, parent, width, height):
         win.geometry(f"{width}x{height}+{x}+{y}")
     except Exception:
         win.geometry(f"{width}x{height}")
+
+def _safe_dedication(value, default=1.0):
+    """Coerce a stored dedication ratio to a usable float. Config values can
+    end up as None or non-numeric (e.g. an imported team-data file with an
+    explicit 'null'), which used to raise mid-render and silently abort
+    whatever popup or card list was being built. This never raises."""
+    try:
+        return float(value) if value is not None else default
+    except (TypeError, ValueError):
+        return default
+
+def _team_dedications(config, active_team):
+    """Safely resolve config['team_member_dedications'][active_team],
+    tolerating a missing/None dict at either level."""
+    outer = config.get("team_member_dedications")
+    if not isinstance(outer, dict):
+        return {}
+    inner = outer.get(active_team)
+    return inner if isinstance(inner, dict) else {}
+
+def _effective_dedication(config, username, teams):
+    """A member's dedication for a given set of (real, non-'All Teams')
+    team names: the sum of their explicit per-team overrides across those
+    teams. This is what lets a member split across two teams (e.g. 50% +
+    50%) show 100% when both teams are selected in the 🔍 Teams filter,
+    and just their portion when only one is.
+
+    If none of `teams` has an override for them yet, falls back to their
+    single base value — so members nobody has split up still work exactly
+    as before. Checks the legacy "All Teams" bucket last, since that's
+    where every dedication used to land before per-team overrides existed
+    (config["selected_team"], the old scoping key, was never actually
+    reachable from the UI — it had no control wired to it)."""
+    contributing = [
+        _safe_dedication(_team_dedications(config, team)[username])
+        for team in teams
+        if team != "All Teams" and username in _team_dedications(config, team)
+    ]
+    if contributing:
+        return sum(contributing)
+    base = config.get("member_dedications") or {}
+    if username in base:
+        return _safe_dedication(base[username])
+    legacy_all = _team_dedications(config, "All Teams")
+    if username in legacy_all:
+        return _safe_dedication(legacy_all[username])
+    return 1.0
 
 def _ticket_has_checklist(config, ticket_key):
     """Return True/False for whether ticket_key has a to-do/checklist, using the cache."""
@@ -214,6 +262,42 @@ def calculate_holiday_subtraction_seconds(start_date_str, holiday_dates_list):
         return int(deducted_hours * 3600)
     except Exception: return 0
 
+
+def calculate_holiday_subtraction_seconds_for_range(start_date_str, end_date_str, holiday_dates_list):
+    """
+    History variant of calculate_holiday_subtraction_seconds: full
+    HOURS_PER_DAY deduction for every weekday holiday within
+    [start_date, end_date) — end_date EXCLUSIVE.
+
+    Jira sprint boundaries are typically back-to-back: a sprint's endDate
+    is usually the exact same instant as the next sprint's startDate, so
+    that boundary day belongs to the NEXT sprint, not this one. Counting
+    it here (as the live function's inclusive, "now"-based loop would)
+    silently pulls one extra day — today, if this sprint happens to end
+    today — into a supposedly-closed sprint's totals. No partial-day
+    slicing either: unlike the live function, every day in a closed
+    sprint's range has already fully elapsed, so a holiday always
+    subtracts a full day, never a partial one.
+    """
+    if not start_date_str or not end_date_str or not holiday_dates_list: return 0
+    try:
+        start_dt = datetime.fromisoformat(start_date_str.replace("Z", "+00:00")).replace(tzinfo=None)
+        end_dt = datetime.fromisoformat(end_date_str.replace("Z", "+00:00")).replace(tzinfo=None)
+        if end_dt <= start_dt: return 0
+        holiday_days = set()
+        for d_str in holiday_dates_list:
+            try: holiday_days.add(datetime.strptime(d_str.strip(), "%Y-%m-%d").date())
+            except ValueError: continue
+        deducted_hours = 0.0
+        current = start_dt
+        while current.date() < end_dt.date():   # end date EXCLUSIVE
+            if current.weekday() < 5 and current.date() in holiday_days:
+                deducted_hours += HOURS_PER_DAY
+            try: current = current + timedelta(days=1)
+            except OverflowError: break
+        return int(deducted_hours * 3600)
+    except Exception: return 0
+
 # --- CUSTOM EMBEDDED INLINE CALENDAR COMPONENT FRAME ---
 class EmbeddedCalendarSelector(ctk.CTkFrame):
     def __init__(self, parent, current_selections, on_save_callback):
@@ -277,7 +361,468 @@ class EmbeddedCalendarSelector(ctk.CTkFrame):
     def save_and_close(self):
         self.on_save_callback(sorted(list(self.selected_dates)))
 
-def open_member_dashboard(config, username, parent=None):
+# =========================================================
+# 🎫 OPEN TICKETS — shared by the main view, Team Tickets view,
+# and Teams Overview view.
+#
+# Pressing "Open Tickets" goes straight to results — no popup, no type
+# to choose first (the old picker's default choice, "Task", used to
+# silently do nothing). It lists tickets from the last 5 sprints, scoped
+# to the project(s) selected at login (config['selected_projects']), with
+# status not in (Closed, Approved, Resolved), where the assignee or the
+# reporter is one of the team members tracked in this app. Grouped by
+# sprint, then by assignee.
+# =========================================================
+def open_my_team_tickets_window(config, parent, team_name=None):
+    """
+    Direct results window (no intermediate popup): not-closed, not-approved,
+    not-resolved tickets from the last 5 sprints, scoped to the currently
+    selected project(s).
+
+    team_name=None (default): assignee or reporter is one of the team
+    members in config['members'] — used by the main dashboard / "Team
+    Tickets" call sites.
+
+    team_name="<Team>": scoped instead to that team's ticket-level 'Team'
+    field, ignoring config['members'] — used by the Teams Overview call
+    site, so results follow whichever team is picked there instead of the
+    main dashboard's tracked roster.
+
+    Grouped by sprint, then by assignee; each row shows the ticket key (as
+    a clickable link), assignee, and status.
+    """
+    project_label = ", ".join(config.get("selected_projects") or ["SytProjectMgt"])
+    who_label = team_name if team_name else "My Team"
+
+    win = ctk.CTkToplevel(parent)
+    win.title(f"🎫 Open Tickets — {who_label} ({project_label})")
+    win.transient(parent)
+    win.configure(fg_color=APP_BG)
+    _position_over_parent(win, parent, 820, 560)
+
+    header = ctk.CTkFrame(win, fg_color=NAV_BG, height=50)
+    header.pack(fill="x", padx=15, pady=(15, 0))
+    header.pack_propagate(False)
+    ctk.CTkLabel(
+        header, text=f"🎫 {who_label} — Open Tickets ({project_label})",
+        font=(FONT_FAMILY, 16, "bold"), text_color=TEXT_MAIN
+    ).pack(side="left", padx=15, pady=12)
+
+    scroll = ctk.CTkScrollableFrame(win, fg_color="transparent")
+    scroll.pack(fill="both", expand=True, padx=15, pady=15)
+
+    loading_lbl = ctk.CTkLabel(scroll, text=f"🔄 Fetching tickets from the last 5 sprints for {who_label}...",
+                                font=(FONT_FAMILY, 13), text_color=TEXT_MUTED)
+    loading_lbl.pack(pady=30)
+
+    STATUS_COLORS = {
+        "To Do": "#f87171", "In Progress": "#fb923c", "Done": "#34d399",
+        "Approved": "#60a5fa", "Blocked": "#dc2626", "Partially Blocked": "#eab308",
+    }
+
+    def _sprint_sort_key(name):
+        # Sprint names usually embed a number (e.g. "Sprint 23") — sort
+        # numerically on that so sprints appear in natural order instead of
+        # alphabetically ("Sprint 10" before "Sprint 2"). "No Sprint" sorts
+        # last regardless.
+        if name == "No Sprint":
+            return (2, 0, name.lower())
+        m = re.search(r'(\d+)', name)
+        return (0, int(m.group(1)), name.lower()) if m else (1, 0, name.lower())
+
+    def render(tickets):
+        for w in scroll.winfo_children():
+            w.destroy()
+
+        if tickets is None:
+            ctk.CTkLabel(scroll, text="⚠️ Could not load tickets — see console for details.",
+                         font=(FONT_FAMILY, 13), text_color="#ef4444").pack(pady=30)
+            return
+        if not tickets:
+            empty_text = (
+                f"No open tickets found for {team_name}."
+                if team_name else
+                "No open tickets found.\nIf your member list is empty, add members first "
+                "via 📋 Team Tickets → member picker."
+            )
+            ctk.CTkLabel(
+                scroll, text=empty_text,
+                font=(FONT_FAMILY, 13), text_color=TEXT_MUTED, justify="center"
+            ).pack(pady=30)
+            return
+
+        by_sprint = {}
+        for key, url, status, assignee, sprint_name in tickets:
+            by_sprint.setdefault(sprint_name, []).append((key, url, status, assignee))
+
+        for sprint_name in sorted(by_sprint.keys(), key=_sprint_sort_key):
+            group = by_sprint[sprint_name]
+            sprint_header = ctk.CTkFrame(scroll, fg_color=CARD_BG, corner_radius=8)
+            sprint_header.pack(fill="x", pady=(10, 4), padx=2)
+            ctk.CTkLabel(
+                sprint_header, text=f"🏁 {sprint_name}  ({len(group)} tickets)",
+                font=(FONT_FAMILY, 13, "bold"), text_color=ACCENT_BLUE
+            ).pack(anchor="w", padx=12, pady=8)
+
+            for key, url, status, assignee in sorted(group, key=lambda t: (t[3].lower(), t[0])):
+                row = ctk.CTkFrame(scroll, fg_color=ITEM_BG, corner_radius=6, border_width=1, border_color=BORDER_COLOR)
+                row.pack(fill="x", padx=20, pady=3)
+
+                link_btn = ctk.CTkButton(
+                    row, text=key, font=(FONT_FAMILY, 12, "bold"), text_color=ACCENT_BLUE,
+                    fg_color="transparent", hover_color=BTN_HOVER, width=90, anchor="w",
+                    command=lambda u=url: webbrowser.open(u)
+                )
+                link_btn.pack(side="left", padx=(10, 5), pady=6)
+
+                ctk.CTkLabel(
+                    row, text=f"👤 {assignee}", font=(FONT_FAMILY, 11), text_color=TEXT_MAIN, anchor="w"
+                ).pack(side="left", padx=(5, 5), pady=6, fill="x", expand=True)
+
+                ctk.CTkLabel(
+                    row, text=status, font=(FONT_FAMILY, 10, "bold"),
+                    fg_color=STATUS_COLORS.get(status, "#888888"), text_color="#ffffff",
+                    corner_radius=4, width=110
+                ).pack(side="right", padx=10, pady=6)
+
+    def load():
+        try:
+            tickets = get_my_team_open_tickets(config, team_name)
+        except Exception as e:
+            print(f"[open_my_team_tickets_window] Error: {e}")
+            tickets = None
+        win.after(0, lambda: render(tickets))
+
+    threading.Thread(target=load, daemon=True).start()
+
+
+# =========================================================
+# 📜 HISTORY — pick one of the last several closed sprints and see the
+# "MY TEAM" cards + "MY Tickets" swimlanes for that sprint, the same two
+# sections shown on the main dashboard, but frozen to that past sprint
+# instead of whatever is currently open.
+# =========================================================
+def open_history_window(config, parent):
+    """
+    Checkbox list of the last 10 closed sprints (get_closed_sprints).
+    Checking one and pressing "View Sprint" opens
+    open_sprint_snapshot_window for it. Only one box may be checked at a
+    time — checking a new one unchecks the previous (radio-button
+    behavior via checkboxes, so it stays visually consistent with the
+    checkbox style used elsewhere in the app).
+    """
+    win = ctk.CTkToplevel(parent)
+    win.title("📜 History — Past Sprints")
+    win.transient(parent)
+    win.configure(fg_color=APP_BG)
+    _position_over_parent(win, parent, 480, 560)
+
+    header = ctk.CTkFrame(win, fg_color=NAV_BG, height=50)
+    header.pack(fill="x", padx=15, pady=(15, 0))
+    header.pack_propagate(False)
+    ctk.CTkLabel(
+        header, text="📜 View a Past Sprint",
+        font=(FONT_FAMILY, 16, "bold"), text_color=TEXT_MAIN
+    ).pack(side="left", padx=15, pady=12)
+
+    search_row = ctk.CTkFrame(win, fg_color="transparent")
+    search_row.pack(fill="x", padx=15, pady=(10, 0))
+    search_entry = ctk.CTkEntry(search_row, placeholder_text="🔍 Search sprints by name...",
+                                 fg_color=ITEM_BG, border_color=BORDER_COLOR,
+                                 font=(FONT_FAMILY, 12), text_color=TEXT_MAIN)
+    search_entry.pack(fill="x")
+
+    scroll = ctk.CTkScrollableFrame(win, fg_color="transparent")
+    scroll.pack(fill="both", expand=True, padx=15, pady=15)
+
+    loading_lbl = ctk.CTkLabel(scroll, text="🔄 Loading past sprints...",
+                                font=(FONT_FAMILY, 13), text_color=TEXT_MUTED)
+    loading_lbl.pack(pady=30)
+
+    check_vars = {}       # sprint id -> BooleanVar
+    sprint_by_id = {}     # sprint id -> raw sprint dict, insertion order == newest-first
+
+    btn_row = ctk.CTkFrame(win, fg_color="transparent")
+    btn_row.pack(fill="x", padx=15, pady=(0, 15))
+
+    def _fmt_range(sprint):
+        def _fmt(d):
+            if not d:
+                return "?"
+            try:
+                return datetime.fromisoformat(d.replace("Z", "+00:00")).strftime("%b %d, %Y")
+            except Exception:
+                return d
+        return f"{_fmt(sprint.get('startDate'))} → {_fmt(sprint.get('endDate'))}"
+
+    def _on_check(checked_id):
+        # Radio behavior: enforce at most one checked box.
+        for sid, var in check_vars.items():
+            if sid != checked_id:
+                var.set(False)
+
+    def view_selected():
+        selected_ids = [sid for sid, var in check_vars.items() if var.get()]
+        if not selected_ids:
+            messagebox.showinfo("No sprint selected", "Check a sprint first, then press View Sprint.")
+            return
+        sprint = sprint_by_id[selected_ids[0]]
+        open_sprint_snapshot_window(config, win, sprint)
+
+    view_btn = ctk.CTkButton(btn_row, text="👁 View Sprint", font=(FONT_FAMILY, 13, "bold"),
+                              fg_color=ACCENT_BLUE, hover_color=ACCENT_HOVER, command=view_selected)
+
+    def render_visible(filter_text=""):
+        """Rebuild the visible rows from sprint_by_id, filtered by name.
+        check_vars are keyed by sprint id and created once in render(), so
+        filtering (which only changes which rows are packed) never loses a
+        checked selection even if that row is temporarily hidden."""
+        for w in scroll.winfo_children():
+            w.destroy()
+
+        term = filter_text.strip().lower()
+        shown = [s for s in sprint_by_id.values() if term in s.get("name", "").lower()] if term else list(sprint_by_id.values())
+
+        if not shown:
+            ctk.CTkLabel(scroll, text="No matching sprints.",
+                         font=(FONT_FAMILY, 13), text_color=TEXT_MUTED).pack(pady=30)
+            return
+
+        for sprint in shown:
+            sid = sprint.get("id")
+            row = ctk.CTkFrame(scroll, fg_color=ITEM_BG, corner_radius=6, border_width=1, border_color=BORDER_COLOR)
+            row.pack(fill="x", pady=4)
+
+            cb = ctk.CTkCheckBox(
+                row, text="", variable=check_vars[sid], width=18, checkbox_width=18, checkbox_height=18,
+                border_width=1, hover_color=BTN_HOVER, fg_color=ACCENT_BLUE,
+                command=lambda s=sid: _on_check(s)
+            )
+            cb.pack(side="left", padx=(12, 8), pady=10)
+
+            text_col = ctk.CTkFrame(row, fg_color="transparent")
+            text_col.pack(side="left", fill="x", expand=True, pady=8)
+            ctk.CTkLabel(text_col, text=sprint.get("name", "Unnamed Sprint"),
+                         font=(FONT_FAMILY, 13, "bold"), text_color=TEXT_MAIN, anchor="w").pack(anchor="w")
+            ctk.CTkLabel(text_col, text=_fmt_range(sprint),
+                         font=(FONT_FAMILY, 11), text_color=TEXT_MUTED, anchor="w").pack(anchor="w")
+
+    def render(sprints):
+        loading_lbl.destroy()
+        if not sprints:
+            ctk.CTkLabel(scroll, text="No closed sprints found.",
+                         font=(FONT_FAMILY, 13), text_color=TEXT_MUTED).pack(pady=30)
+            return
+
+        for sprint in sprints:
+            sid = sprint.get("id")
+            sprint_by_id[sid] = sprint
+            check_vars[sid] = ctk.BooleanVar(value=False)
+
+        search_entry.bind("<KeyRelease>", lambda e: render_visible(search_entry.get()))
+        render_visible()
+        view_btn.pack(pady=0)
+
+    def load():
+        sprints = get_closed_sprints(config, 30)
+        win.after(0, lambda: render(sprints))
+
+    threading.Thread(target=load, daemon=True).start()
+
+
+def open_sprint_snapshot_window(config, parent, sprint):
+    """
+    History snapshot for a single past, closed sprint: the same two
+    sections shown on the main dashboard — "👥 MY TEAM" logging cards and
+    "🎫 MY Tickets" swimlanes — except frozen to `sprint` instead of
+    whatever's currently open, via sprint_id passed down to get_jira_data /
+    get_team_member_logging.
+
+    Unlike the live dashboard, this is a read-only, one-shot snapshot: no
+    auto-refresh loop, no editing (add/remove member, dedication, etc.) —
+    it exists purely to look back at how a sprint went.
+    """
+    sprint_id   = sprint.get("id")
+    sprint_name = sprint.get("name", "Unknown Sprint")
+    start_date  = sprint.get("startDate")
+    end_date    = sprint.get("endDate")
+
+    win = ctk.CTkToplevel(parent)
+    win.title(f"📜 History — {sprint_name}")
+    win.transient(parent)
+    win.configure(fg_color=APP_BG)
+    win.geometry("1150x850")
+
+    header = ctk.CTkFrame(win, fg_color=NAV_BG, height=55)
+    header.pack(fill="x", padx=20, pady=(20, 10))
+    header.pack_propagate(False)
+    ctk.CTkLabel(header, text=f"📜 {sprint_name} (closed)",
+                 font=(FONT_FAMILY, 16, "bold"), text_color=TEXT_MAIN).pack(side="left", padx=20)
+
+    def _fmt(d):
+        if not d:
+            return "?"
+        try:
+            return datetime.fromisoformat(d.replace("Z", "+00:00")).strftime("%b %d, %Y")
+        except Exception:
+            return d
+    ctk.CTkLabel(header, text=f"{_fmt(start_date)} → {_fmt(end_date)}",
+                 font=(FONT_FAMILY, 12), text_color=TEXT_MUTED).pack(side="left", padx=(0, 20))
+
+    STATUS_COLORS_SNAP = {
+        "To Do": "#f87171", "In Progress": "#fb923c", "Done": "#34d399",
+        "Approved": "#60a5fa", "Blocked": "#dc2626", "Partially Blocked": "#eab308",
+    }
+
+    # ── 👥 MY TEAM section ────────────────────────────────────────────────
+    team_section = ctk.CTkFrame(win, fg_color="transparent")
+    team_section.pack(fill="x", padx=20, pady=(0, 10))
+    ctk.CTkLabel(team_section, text="👥 MY TEAM", font=(FONT_FAMILY, 12, "bold"),
+                 text_color=TEXT_MUTED).pack(anchor="w", padx=10, pady=(0, 4))
+
+    team_scroll = ctk.CTkScrollableFrame(team_section, height=200, orientation="horizontal", fg_color="transparent")
+    team_scroll.pack(fill="x")
+    team_loading_lbl = ctk.CTkLabel(team_scroll, text="🔄 Loading team logging for this sprint...",
+                                     font=(FONT_FAMILY, 12), text_color=TEXT_MUTED)
+    team_loading_lbl.pack(padx=10, pady=10)
+
+    def render_team_cards(member_logged):
+        for w in team_scroll.winfo_children():
+            w.destroy()
+
+        roster = sorted({m for m in config.get("members", {}).keys() if m and m != "Unassigned"})
+        if not roster:
+            ctk.CTkLabel(team_scroll, text="No members tracked. Add members via 📋 Team Tickets.",
+                         font=(FONT_FAMILY, 12), text_color=TEXT_MUTED).pack(padx=10, pady=10)
+            return
+
+        all_real_teams = [t for t in get_teams_list(config) if t != "All Teams"]
+
+        # Both figures below span this sprint's own start→end date range (not
+        # "today") — the whole sprint counts as elapsed since it's closed.
+        holiday_seconds = calculate_holiday_subtraction_seconds_for_range(start_date, end_date, config.get("holiday_dates", []))
+        base_expected = calculate_expected_hours_for_sprint(start_date, end_date) * 3600 if start_date and end_date else 0
+
+        member_logged = member_logged or {}
+
+        for member in roster:
+            m_dedication = _effective_dedication(config, member, all_real_teams)
+            has_tickets = member in member_logged   # member_logged only contains
+            # members who own at least one ticket in THIS sprint (see
+            # get_team_overview_and_logging: every owner gets an entry, even
+            # if their logged time is 0) — absence means no ticket at all,
+            # which is a different situation from "had a ticket, logged 0".
+            logged = member_logged.get(member, 0)
+            expected = max(0, (base_expected - holiday_seconds) * m_dedication)
+
+            if not has_tickets:
+                status_txt, status_color = "No tickets in this sprint", TEXT_MUTED
+            elif expected and logged >= expected:
+                status_txt, status_color = "🚀 Fully Logged", "#059669"
+            elif expected:
+                status_txt, status_color = f"Missing: {format_time(expected - logged)}", "#ef4444"
+            else:
+                status_txt, status_color = "—", TEXT_MUTED
+
+            card = ctk.CTkFrame(team_scroll, width=210, height=180, fg_color=CARD_BG,
+                                 border_width=1, border_color=BORDER_COLOR, corner_radius=10)
+            card.pack(side="left", padx=8, pady=4)
+            card.pack_propagate(False)
+
+            ctk.CTkLabel(card, text=member, font=(FONT_FAMILY, 13, "bold"), text_color=TEXT_MAIN).pack(pady=(12, 2))
+            ctk.CTkLabel(card, text=f"Dedication: {int(m_dedication*100)}% (current)", font=(FONT_FAMILY, 11),
+                         text_color=TEXT_MUTED).pack()
+            ctk.CTkLabel(card, text=f"Logged: {format_time(logged)}" if has_tickets else "Logged: —",
+                         font=(FONT_FAMILY, 12, "bold"),
+                         text_color="#34d399" if has_tickets else TEXT_MUTED).pack(pady=(8, 0))
+            ctk.CTkLabel(card, text=f"Expected (full sprint): {format_time(expected)}" if has_tickets else "Expected: —",
+                         font=(FONT_FAMILY, 10), text_color=TEXT_MUTED).pack(pady=(0, 6))
+
+            badge = ctk.CTkFrame(card, fg_color=status_color, corner_radius=5, height=30)
+            badge.pack(fill="x", padx=12, pady=(0, 12))
+            badge.pack_propagate(False)
+            ctk.CTkLabel(badge, text=status_txt, font=(FONT_FAMILY, 11, "bold"), text_color="#ffffff",
+                         wraplength=180, justify="center").pack(expand=True)
+
+    # ── 🎫 MY Tickets section ─────────────────────────────────────────────
+    scroll = ctk.CTkScrollableFrame(win, fg_color="transparent")
+    scroll.pack(fill="both", expand=True, padx=20, pady=10)
+
+    my_loading_lbl = ctk.CTkLabel(scroll, text="🔄 Loading your tickets for this sprint...",
+                                   font=(FONT_FAMILY, 13), text_color=TEXT_MUTED)
+    my_loading_lbl.pack(pady=30)
+
+    def render_my_tickets(tickets, totals):
+        for w in scroll.winfo_children():
+            w.destroy()
+
+        if tickets is None:
+            ctk.CTkLabel(scroll, text="⚠️ Could not load your tickets for this sprint.",
+                         font=(FONT_FAMILY, 13), text_color="#ef4444").pack(pady=30)
+            return
+
+        swimlanes = [("🟥 To Do", "todo", "#f87171"), ("🟧 In Progress", "in_progress", "#fb923c"),
+                     ("🟦 Approved", "approved", "#60a5fa"), ("⛔ Blocked", "blocked", "#dc2626"),
+                     ("🟡 Partially Blocked", "partially_blocked", "#eab308"), ("🟩 Done", "done", "#34d399")]
+        lane_bg = CARD_BG[1] if isinstance(CARD_BG, tuple) else CARD_BG
+
+        for title, key, heading_color in swimlanes:
+            lane_frame = ctk.CTkFrame(scroll, fg_color=lane_bg, corner_radius=10, border_width=1, border_color=BORDER_COLOR)
+            lane_frame.pack(fill="x", pady=10, ipady=5)
+            ctk.CTkLabel(lane_frame, text=f"{title} ({format_time(totals[key])})", font=(FONT_FAMILY, 14, "bold"),
+                         text_color=heading_color).pack(anchor="w", padx=15, pady=12)
+
+            if not tickets[key]:
+                ctk.CTkLabel(lane_frame, text="Empty queue lane.", font=(FONT_FAMILY, 12, "italic"),
+                             text_color=TEXT_MUTED).pack(anchor="w", padx=30, pady=5)
+                continue
+
+            for item in tickets[key]:
+                t_key, sumry, link, sp, rm, activity_lbl, validation_lbl, est_time, *extra = item
+                activity_lbl = activity_lbl if activity_lbl else "N/A"
+                item_box = ctk.CTkFrame(lane_frame, fg_color=ITEM_BG, corner_radius=6, border_width=1, border_color=BORDER_COLOR)
+                item_box.pack(fill="x", padx=15, pady=4)
+                ctk.CTkLabel(item_box, text=sp if sp else "0h", font=(FONT_FAMILY, 12, "bold"),
+                             text_color="#34d399", width=110, anchor="e").pack(side="right", padx=20, pady=8)
+                ctk.CTkLabel(item_box, text=est_time if est_time else "0h", font=(FONT_FAMILY, 12),
+                             text_color=TEXT_MUTED, width=120, anchor="e").pack(side="right", padx=10, pady=8)
+                act_badge = ctk.CTkFrame(item_box, fg_color=BTN_BG if activity_lbl != "N/A" else "transparent", corner_radius=4)
+                act_badge.pack(side="right", padx=15, pady=6)
+                ctk.CTkLabel(act_badge, text=str(activity_lbl).upper(), font=(FONT_FAMILY, 10, "bold"),
+                             text_color=ACCENT_BLUE if activity_lbl != "N/A" else TEXT_MUTED, width=120, anchor="center").pack(padx=8, pady=2)
+                l = ctk.CTkLabel(item_box, text=f"[{t_key}] {sumry}", font=(FONT_FAMILY, 12), text_color=TEXT_MAIN,
+                                 cursor="hand2", justify="left", anchor="w", wraplength=0)
+                l.pack(side="left", fill="x", expand=True, padx=15, pady=8)
+                l.bind("<Button-1>", lambda e, url=link: webbrowser.open(url))
+
+    def load():
+        try:
+            tickets, totals, logged, _ = get_jira_data(config, sprint_id=sprint_id)
+        except Exception as e:
+            print(f"[open_sprint_snapshot_window] my-tickets error: {e}")
+            tickets, totals = None, None
+        win.after(0, lambda: (my_loading_lbl.destroy(), render_my_tickets(tickets, totals)))
+
+        roster = sorted({m for m in config.get("members", {}).keys() if m and m != "Unassigned"})
+        try:
+            member_logged = get_sprint_member_logging(config, sprint_id, roster)
+        except Exception as e:
+            print(f"[open_sprint_snapshot_window] team-logging error: {e}")
+            member_logged = {}
+        win.after(0, lambda: (team_loading_lbl.destroy(), render_team_cards(member_logged)))
+
+    threading.Thread(target=load, daemon=True).start()
+
+
+def open_member_dashboard(config, username, parent, filter_teams=None):
+    """Full ticket dashboard for a single team member: dedication %,
+    real-time expected-vs-logged status, and every open ticket broken out
+    by category. Opened from a member card's "View Tickets" button.
+
+    filter_teams: the currently selected team filter (selected_teams["value"]
+    from the main dashboard) — tickets, logged time, and dedication are all
+    scoped to these team(s), same as the roster cards. None/omitted falls
+    back to all teams (unscoped)."""
     win = ctk.CTkToplevel(parent)
     if parent:
         _position_over_parent(win, parent, 1050, 750)
@@ -291,24 +836,24 @@ def open_member_dashboard(config, username, parent=None):
     cancelled = {"value": False}
     
     def load():
-        active_team = config.get("selected_team", "All Teams")
-        tickets, totals, logged, _ = get_jira_data(config, username, force_team_filter=active_team)
+        team_filter = filter_teams if filter_teams is not None else set(get_teams_list(config))
+        tickets, totals, logged, _ = get_jira_data(config, username, force_team_filter=team_filter)
         sprint = get_effective_sprint(config)
         if not tickets or cancelled["value"]: return
-        team_dedications = config.get("team_member_dedications", {}).get(active_team, {})
-        old_fallback = config.get("member_dedications", {}).get(username, 1.0)
-        m_dedication = team_dedications.get(username, old_fallback)
+        m_dedication = _effective_dedication(config, username, team_filter)
         base_expected = calculate_expected_hours(sprint["startDate"]) * 3600 if sprint else 0
         holiday_seconds = calculate_holiday_subtraction_seconds(sprint["startDate"] if sprint else None, config.get("holiday_dates", []))
         expected = max(0, (base_expected - holiday_seconds) * m_dedication)
-        if not cancelled["value"]: win.after(0, lambda: render_dashboard_ui(scroll, username, m_dedication, logged, expected, tickets, totals))
+        scope_label = "All Teams" if set(team_filter) == set(get_teams_list(config)) else (", ".join(sorted(team_filter)) or "All Teams")
+        if not cancelled["value"]: win.after(0, lambda: render_dashboard_ui(scroll, username, m_dedication, logged, expected, tickets, totals, scope_label))
 
-    def render_dashboard_ui(scroll, username, m_dedication, logged, expected, tickets, totals):
+    def render_dashboard_ui(scroll, username, m_dedication, logged, expected, tickets, totals, scope_label="All Teams"):
         if cancelled["value"]: return
         header_card = ctk.CTkFrame(scroll, fg_color=CARD_BG, corner_radius=12, border_width=1, border_color=BORDER_COLOR)
         header_card.pack(fill="x", pady=(0, 20), ipady=10)
         ctk.CTkLabel(header_card, text=f"👤 {username}", font=(FONT_FAMILY, 24, "bold"), text_color=TEXT_MAIN).pack(pady=(10, 2))
         ctk.CTkLabel(header_card, text=f"Dedication: {int(m_dedication*100)}%", font=(FONT_FAMILY, 13), text_color=TEXT_MUTED).pack()
+        ctk.CTkLabel(header_card, text=f"Scope: {scope_label}", font=(FONT_FAMILY, 11), text_color=TEXT_MUTED).pack()
         msg, badge_color = ("🚀 On Track / Great Job!", "#059669") if logged >= expected else (f"⚠️ Missing : {format_time(expected - logged)}", "#dc2626")
         status_badge = ctk.CTkFrame(header_card, fg_color=badge_color, corner_radius=20, height=32)
         status_badge.pack(pady=12, padx=20)
@@ -445,6 +990,9 @@ def open_team_tickets_dashboard(config, parent=None):
     btns_right.pack(side="right", padx=10)
     toggle_btn = ctk.CTkButton(btns_right, text="📊 Hide Summary", width=120, height=28, font=(FONT_FAMILY, 12, "bold"), fg_color=ACCENT_BLUE, hover_color=ACCENT_HOVER, command=toggle_summary)
     toggle_btn.pack(side="left", padx=5)
+    type_btn = ctk.CTkButton(btns_right, text="🎫 Open Tickets", width=130, height=28, font=(FONT_FAMILY, 12, "bold"), fg_color=CARD_BG, hover_color=BTN_HOVER, text_color=TEXT_MAIN, border_width=1, border_color=BORDER_COLOR,
+                              command=lambda: open_my_team_tickets_window(config, win))
+    type_btn.pack(side="left", padx=5)
     filter_container = ctk.CTkFrame(top_bar, fg_color="transparent")
     filter_container.pack(side="right", padx=20)
     summary_container = ctk.CTkFrame(win, fg_color="transparent")
@@ -995,6 +1543,13 @@ def open_teams_overview_dashboard(config, parent=None):
                                 fg_color=ACCENT_BLUE, hover_color=ACCENT_HOVER,
                                 command=toggle_summary)
     toggle_btn.pack(side="right", padx=(0, 10))
+
+    type_btn = ctk.CTkButton(top_bar, text="🎫 Open Tickets", width=130, height=28,
+                              font=(FONT_FAMILY, 12, "bold"),
+                              fg_color=CARD_BG, hover_color=BTN_HOVER, text_color=TEXT_MAIN,
+                              border_width=1, border_color=BORDER_COLOR,
+                              command=lambda: open_my_team_tickets_window(config, win, current_team["value"]))
+    type_btn.pack(side="right", padx=(0, 10))
 
     # ── row 1 : member logging cards ─────────────────────────────────────
     member_section = ctk.CTkFrame(win, fg_color="transparent")
@@ -1778,21 +2333,19 @@ def run_dashboard(config):
             try: m_ded = float(ded_entry.get() or 100) / 100
             except: m_ded = 1.0
             pop.destroy()
-            active_team = config.get("selected_team", "All Teams")
+            team_filter = selected_teams["value"]
             config.setdefault("members", {})[u] = "Syncing..."
-            if "team_member_dedications" not in config: config["team_member_dedications"] = {}
-            if active_team not in config["team_member_dedications"]: config["team_member_dedications"][active_team] = {}
-            config["team_member_dedications"][active_team][u] = m_ded
+            config.setdefault("member_dedications", {})[u] = m_ded
             save_config(config)
             refresh_saved_list()
             
             def fetch():
                 config.setdefault("member_avatars", {})
-                tickets, _, logged, avatar_url = get_jira_data(config, u, force_team_filter=active_team)
+                tickets, _, logged, avatar_url = get_jira_data(config, u, force_team_filter=team_filter)
                 sprint = get_effective_sprint(config)
                 if avatar_url and isinstance(avatar_url, str): config["member_avatars"][u] = avatar_url
                 total_tickets = sum(len(tickets[cat]) for cat in tickets) if tickets else 0
-                if active_team != "All Teams" and total_tickets == 0: config["members"][u] = "HIDDEN_NO_TICKETS"
+                if team_filter != set(get_teams_list(config)) and total_tickets == 0: config["members"][u] = "HIDDEN_NO_TICKETS"
                 else:
                     base_expected = calculate_expected_hours(sprint["startDate"]) * 3600 if sprint else 0
                     holiday_seconds = calculate_holiday_subtraction_seconds(sprint["startDate"] if sprint else None, config.get("holiday_dates", []))
@@ -1905,6 +2458,7 @@ def run_dashboard(config):
         """Called when team selection changes"""
         refresh_saved_list()
         refresh_main()
+        refresh_all_members()
     
     team_filter_btn = ctk.CTkButton(header_row, text="🔍 Teams", font=(FONT_FAMILY, 11, "bold"),
                                      fg_color=CARD_BG, hover_color=BTN_HOVER,
@@ -1945,7 +2499,7 @@ def run_dashboard(config):
         members_scroll = ctk.CTkScrollableFrame(content, fg_color=ITEM_BG, corner_radius=8)
         members_scroll.pack(fill="both", expand=True, pady=(0, 16))
         
-        members_state = {"checkboxes": {}, "data": {}}
+        members_state = {"checkboxes": {}, "data": {}, "dedication_entries": {}}
         
         def load_team_members():
             """Load and display members from selected team"""
@@ -1953,6 +2507,7 @@ def run_dashboard(config):
             for child in members_scroll.winfo_children():
                 child.destroy()
             members_state["checkboxes"].clear()
+            members_state["dedication_entries"].clear()
             
             team_name = team_var.get()
             if not team_name:
@@ -1968,7 +2523,7 @@ def run_dashboard(config):
                     members_logging = get_team_member_logging(config, team_name)
                     modal.after(0, lambda ml=members_logging: display_members(ml))
                 except Exception as e:
-                    modal.after(0, lambda: display_error(str(e)))
+                    modal.after(0, lambda err=e: display_error(str(err)))
             
             def display_members(members):
                 for child in members_scroll.winfo_children():
@@ -1986,7 +2541,10 @@ def run_dashboard(config):
                                text_color=ACCENT_BLUE, checkbox_width=16, checkbox_height=16,
                                border_width=1, fg_color=ACCENT_BLUE).pack(anchor="w", padx=12, pady=(8, 12))
                 
-                # Individual members
+                # Individual members — each row gets its own checkbox plus a
+                # "Dedication %" entry. Blank stays 100% (same blank->100
+                # fallback the login screen's dedication field already uses);
+                # typing a number uses that number as the % for that member.
                 for member_name in sorted(members.keys()):
                     if member_name == "Unassigned":
                         continue
@@ -1994,13 +2552,24 @@ def run_dashboard(config):
                     logged = members[member_name]
                     logged_text = f" ({format_time(logged)} logged)" if logged > 0 else ""
                     
+                    row = ctk.CTkFrame(members_scroll, fg_color="transparent")
+                    row.pack(fill="x", padx=24, pady=3)
+
                     var = ctk.BooleanVar(value=False)
                     members_state["checkboxes"][member_name] = var
                     
-                    ctk.CTkCheckBox(members_scroll, text=f"👤 {member_name}{logged_text}", 
+                    ctk.CTkCheckBox(row, text=f"👤 {member_name}{logged_text}", 
                                    variable=var, font=(FONT_FAMILY, 10),
                                    text_color=TEXT_MAIN, checkbox_width=14, checkbox_height=14,
-                                   border_width=1, fg_color=ACCENT_BLUE).pack(anchor="w", padx=24, pady=3)
+                                   border_width=1, fg_color=ACCENT_BLUE).pack(side="left")
+
+                    ded_entry = ctk.CTkEntry(row, placeholder_text="100", width=55, height=22,
+                                              fg_color=ITEM_BG, border_color=BORDER_COLOR,
+                                              font=(FONT_FAMILY, 10), text_color=TEXT_MAIN, justify="center")
+                    ded_entry.pack(side="right", padx=(2, 0))
+                    ctk.CTkLabel(row, text="Dedication %:", font=(FONT_FAMILY, 9),
+                                 text_color=TEXT_MUTED).pack(side="right", padx=(8, 4))
+                    members_state["dedication_entries"][member_name] = ded_entry
                 
                 members_state["data"]["add_all_var"] = add_all_var
                 members_state["data"]["members"] = members
@@ -2021,9 +2590,30 @@ def run_dashboard(config):
         btn_frame = ctk.CTkFrame(content, fg_color="transparent")
         btn_frame.pack(fill="x", pady=0)
         
+        def _dedication_from_entry(member_name):
+            """Blank field -> 100% (1.0), same fallback the login screen's
+            dedication field uses. Unparseable input also falls back to 100%."""
+            entry = members_state["dedication_entries"].get(member_name)
+            raw = entry.get().strip() if entry is not None else ""
+            try:
+                return float(raw or 100) / 100
+            except ValueError:
+                return 1.0
+        
         def add_members():
             """Add selected members"""
-            selected_team = team_var.get()
+            selected_team = team_var.get()   # this modal's own team dropdown — members
+            # picked here are added as an explicit dedication override for THIS team,
+            # since that's the team whose roster they were just browsed from. (An
+            # earlier version of this pointed at config["selected_team"] instead, on
+            # the theory that it should match change_member_dedication()'s scope —
+            # but that key was never wired to any live control, so it was always
+            # stuck on "All Teams". change_member_dedication() now edits per-team
+            # overrides directly, so this modal's own team is the correct, and only
+            # meaningful, key.)
+            if not isinstance(config.get("team_member_dedications"), dict): config["team_member_dedications"] = {}
+            if not isinstance(config["team_member_dedications"].get(selected_team), dict): config["team_member_dedications"][selected_team] = {}
+            team_dedications = config["team_member_dedications"][selected_team]
             
             if members_state["data"].get("add_all_var") and members_state["data"]["add_all_var"].get():
                 # Add all members
@@ -2031,12 +2621,14 @@ def run_dashboard(config):
                     if member_name != "Unassigned" and member_name not in config["members"]:
                         config["members"][member_name] = "Syncing..."
                         config.setdefault("members_j1", {})[member_name] = "Syncing..."
+                        team_dedications[member_name] = _dedication_from_entry(member_name)
             else:
                 # Add selected members
                 for member_name, var in members_state["checkboxes"].items():
                     if var.get() and member_name not in config["members"]:
                         config["members"][member_name] = "Syncing..."
                         config.setdefault("members_j1", {})[member_name] = "Syncing..."
+                        team_dedications[member_name] = _dedication_from_entry(member_name)
             
             # Get count of newly added members
             added_count = sum(1 for m in config["members"].keys() if config["members"][m] == "Syncing...")
@@ -2355,64 +2947,148 @@ def run_dashboard(config):
     update_holiday_display()
 
     def change_member_dedication(u):
+        real_teams = [t for t in get_teams_list(config) if t != "All Teams"]
+
         pop = ctk.CTkToplevel(app)
-        _position_over_parent(pop, app, 340, 200)
+        _position_over_parent(pop, app, 400, 480)
         pop.title("Capacity Metric")
         pop.configure(fg_color=CARD_BG)
         pop.attributes('-topmost', True)
-        
-        active_team = config.get("selected_team", "All Teams")
-        team_dedications = config.get("team_member_dedications", {}).get(active_team, {})
-        old_fallback = config.get("member_dedications", {}).get(u, 1.0)
-        current_val = int(team_dedications.get(u, old_fallback) * 100)
-        
-        ctk.CTkLabel(pop, text=f"Adjust Dedication Ratio:\n{u} ({active_team})", font=(FONT_FAMILY, 14, "bold"), text_color=TEXT_MAIN).pack(pady=(20, 10))
-        ded_entry = ctk.CTkEntry(pop, width=140, fg_color=ITEM_BG, border_color=BORDER_COLOR, justify="center", text_color=TEXT_MAIN)
-        ded_entry.insert(0, str(current_val))
-        ded_entry.pack()
-        
+
+        ctk.CTkLabel(pop, text=f"Dedication — {u}", font=(FONT_FAMILY, 14, "bold"), text_color=TEXT_MAIN).pack(pady=(18, 2))
+        ctk.CTkLabel(pop, text="Default applies everywhere unless a team below\noverrides it. When several of a member's teams are\nchecked in 🔍 Teams, their %'s are added together.",
+                     font=(FONT_FAMILY, 10), text_color=TEXT_MUTED, justify="center").pack(pady=(0, 12))
+
+        # ── Default / base row ──────────────────────────────────────────────
+        base_row = ctk.CTkFrame(pop, fg_color="transparent")
+        base_row.pack(fill="x", padx=24, pady=(0, 10))
+        ctk.CTkLabel(base_row, text="Default:", font=(FONT_FAMILY, 12, "bold"), text_color=TEXT_MAIN, width=100, anchor="w").pack(side="left")
+        base_dict = config.get("member_dedications") or {}
+        legacy_all = _team_dedications(config, "All Teams")
+        base_current = base_dict[u] if u in base_dict else legacy_all.get(u, 1.0)
+        base_entry = ctk.CTkEntry(base_row, width=70, fg_color=ITEM_BG, border_color=BORDER_COLOR, justify="center", text_color=TEXT_MAIN)
+        base_entry.insert(0, str(int(_safe_dedication(base_current) * 100)))
+        base_entry.pack(side="left")
+        ctk.CTkLabel(base_row, text="%", font=(FONT_FAMILY, 12), text_color=TEXT_MUTED).pack(side="left", padx=(4, 0))
+
+        ctk.CTkFrame(pop, height=1, fg_color=BORDER_COLOR).pack(fill="x", padx=24, pady=(0, 10))
+
+        ctk.CTkLabel(pop, text="Per-team overrides:", font=(FONT_FAMILY, 11, "bold"), text_color=TEXT_MUTED).pack(anchor="w", padx=24)
+        rows_scroll = ctk.CTkScrollableFrame(pop, fg_color="transparent", height=140)
+        rows_scroll.pack(fill="x", padx=14, pady=(4, 4))
+
+        row_state = {}   # team -> {"frame": ..., "entry": ...}
+
+        def add_row(team, prefill):
+            if team in row_state:
+                return
+            r = ctk.CTkFrame(rows_scroll, fg_color="transparent")
+            r.pack(fill="x", pady=3, padx=6)
+            ctk.CTkLabel(r, text=f"{team}:", font=(FONT_FAMILY, 12), text_color=TEXT_MAIN, width=110, anchor="w").pack(side="left")
+            e = ctk.CTkEntry(r, width=60, fg_color=ITEM_BG, border_color=BORDER_COLOR, justify="center", text_color=TEXT_MAIN)
+            e.insert(0, str(int(_safe_dedication(prefill, 1.0) * 100)))
+            e.pack(side="left")
+            ctk.CTkLabel(r, text="%", font=(FONT_FAMILY, 12), text_color=TEXT_MUTED).pack(side="left", padx=(4, 8))
+
+            def _remove():
+                r.destroy()
+                del row_state[team]
+                _refresh_picker()
+
+            ctk.CTkButton(r, text="✕", width=22, height=22, fg_color="transparent", hover_color=BTN_HOVER,
+                          text_color=TEXT_MUTED, font=(FONT_FAMILY, 11), command=_remove).pack(side="left")
+            row_state[team] = {"frame": r, "entry": e}
+
+        for team in real_teams:
+            td = _team_dedications(config, team)
+            if u in td:
+                add_row(team, td[u])
+
+        # ── Add-team-override control ───────────────────────────────────────
+        add_row_frame = ctk.CTkFrame(pop, fg_color="transparent")
+        add_row_frame.pack(fill="x", padx=24, pady=(6, 4))
+        new_team_var = ctk.StringVar()
+
+        def _remaining_teams():
+            return [t for t in real_teams if t not in row_state]
+
+        def _refresh_picker():
+            remaining = _remaining_teams()
+            team_picker.configure(values=remaining or ["—"])
+            new_team_var.set(remaining[0] if remaining else "—")
+
+        team_picker = ctk.CTkOptionMenu(add_row_frame, variable=new_team_var, values=_remaining_teams() or ["—"],
+                                         fg_color=ITEM_BG, button_color=BTN_BG, button_hover_color=BTN_HOVER,
+                                         text_color=TEXT_MAIN, font=(FONT_FAMILY, 11), width=150)
+        team_picker.pack(side="left")
+        _refresh_picker()
+
+        def _add_override():
+            t = new_team_var.get()
+            if not t or t == "—" or t in row_state:
+                return
+            add_row(t, 1.0)
+            _refresh_picker()
+
+        ctk.CTkButton(add_row_frame, text="+ Override", fg_color=BTN_BG, hover_color=BTN_HOVER,
+                      text_color=TEXT_MAIN, font=(FONT_FAMILY, 11, "bold"), width=100, height=26,
+                      command=_add_override).pack(side="left", padx=(8, 0))
+
         def save_dedication():
-            try: m_ded = float(ded_entry.get() or 100) / 100
-            except: m_ded = 1.0
-            
-            if "team_member_dedications" not in config: config["team_member_dedications"] = {}
-            if active_team not in config["team_member_dedications"]: config["team_member_dedications"][active_team] = {}
-            config["team_member_dedications"][active_team][u] = m_ded
+            try: base_ded = float(base_entry.get() or 100) / 100
+            except ValueError: base_ded = 1.0
+            config.setdefault("member_dedications", {})[u] = base_ded
+
+            if not isinstance(config.get("team_member_dedications"), dict):
+                config["team_member_dedications"] = {}
+            for team in real_teams:
+                bucket = config["team_member_dedications"].get(team)
+                if team in row_state:
+                    try: pct = float(row_state[team]["entry"].get() or 100) / 100
+                    except ValueError: pct = 1.0
+                    if not isinstance(bucket, dict):
+                        bucket = config["team_member_dedications"][team] = {}
+                    bucket[u] = pct
+                elif isinstance(bucket, dict) and u in bucket:
+                    del bucket[u]   # row removed in the UI -> drop the stored override
+
             config["members"][u] = "Syncing..."
             save_config(config)
             pop.destroy()
             refresh_saved_list()
-            
+
             def recalculate():
                 sprint = get_effective_sprint(config)
                 config.setdefault("member_avatars", {})
-                tickets, _, logged, avatar_url = get_jira_data(config, u, force_team_filter=active_team)
+                tickets, _, logged, avatar_url = get_jira_data(config, u, force_team_filter="All Teams")
                 if avatar_url and isinstance(avatar_url, str): config["member_avatars"][u] = avatar_url
                 total_tickets = sum(len(tickets[cat]) for cat in tickets) if tickets else 0
-                if active_team != "All Teams" and total_tickets == 0: config["members"][u] = "HIDDEN_NO_TICKETS"
+                if total_tickets == 0:
+                    config["members"][u] = "HIDDEN_NO_TICKETS"
                 else:
+                    effective_ded = _effective_dedication(config, u, real_teams)
                     base_expected = calculate_expected_hours(sprint["startDate"]) * 3600 if sprint else 0
                     holiday_seconds = calculate_holiday_subtraction_seconds(sprint["startDate"] if sprint else None, config.get("holiday_dates", []))
-                    expected = max(0, (base_expected - holiday_seconds) * m_ded)
+                    expected = max(0, (base_expected - holiday_seconds) * effective_ded)
                     res_str = "Great Job! 🚀" if (logged is not None and logged >= expected) else format_time(expected - (logged or 0))
                     config["members"][u] = res_str
                     base_expected_j1 = calculate_expected_hours_j1(sprint["startDate"]) * 3600 if sprint else 0
-                    expected_j1 = max(0, (base_expected_j1 - holiday_seconds) * m_ded)
+                    expected_j1 = max(0, (base_expected_j1 - holiday_seconds) * effective_ded)
                     config.setdefault("members_j1", {})[u] = "J-1: On Track ✅" if (logged is not None and logged >= expected_j1) else f"J-1 Missing: {format_time(expected_j1 - (logged or 0))}"
                 save_config(config)
                 app.after(0, lambda: refresh_saved_list())
-                
+
             threading.Thread(target=recalculate, daemon=True).start()
-            
-        ctk.CTkButton(pop, text="Apply Changes", fg_color=ACCENT_BLUE, hover_color=ACCENT_HOVER, font=(FONT_FAMILY, 13, "bold"), command=save_dedication, width=150).pack(pady=20)
+
+        ctk.CTkButton(pop, text="Apply Changes", fg_color=ACCENT_BLUE, hover_color=ACCENT_HOVER, font=(FONT_FAMILY, 13, "bold"), command=save_dedication, width=150).pack(pady=(8, 18))
 
     def delete_member(u):
         if u in config["members"]: 
             del config["members"][u]
-            if "member_dedications" in config and u in config["member_dedications"]: del config["member_dedications"][u]
-            if "team_member_dedications" in config:
-                for team in config["team_member_dedications"]:
-                    if u in config["team_member_dedications"][team]: del config["team_member_dedications"][team][u]
+            if isinstance(config.get("member_dedications"), dict) and u in config["member_dedications"]: del config["member_dedications"][u]
+            if isinstance(config.get("team_member_dedications"), dict):
+                for team_ded in config["team_member_dedications"].values():
+                    if isinstance(team_ded, dict) and u in team_ded: del team_ded[u]
             if "member_avatars" in config and u in config["member_avatars"]: del config["member_avatars"][u]
             if u in active_card_widgets:
                 active_card_widgets[u]["frame"].destroy()
@@ -2424,9 +3100,6 @@ def run_dashboard(config):
         if "members" not in config: config["members"] = {}
         config.setdefault("member_avatars", {})
         config.setdefault("members_j1", {})
-        
-        team_dedications = config.get("team_member_dedications", {}).get("All Teams", {})
-        old_fallback_dict = config.get("member_dedications", {})
         
         # Filter members by selected teams
         visible_users = set()
@@ -2458,7 +3131,7 @@ def run_dashboard(config):
                 
         for user, status_text in config["members"].items():
             if user not in visible_users: continue
-            m_dedication_value = team_dedications.get(user, old_fallback_dict.get(user, 1.0))
+            m_dedication_value = _effective_dedication(config, user, selected_teams["value"])
             cur_ded_pct = int(m_dedication_value * 100)
 
             # ── Real-time badge ──────────────────────────────────────────────
@@ -2537,7 +3210,7 @@ def run_dashboard(config):
             
             btn_row = ctk.CTkFrame(card, fg_color="transparent")
             btn_row.pack(fill="x", padx=15, side="bottom", pady=(0, 8))
-            ctk.CTkButton(btn_row, text="View Tickets", height=24, font=(FONT_FAMILY, 11, "bold"), fg_color=ACCENT_BLUE, hover_color=ACCENT_HOVER, command=lambda u=user: open_member_dashboard(config, u, app)).pack(fill="x", pady=(0, 4))
+            ctk.CTkButton(btn_row, text="View Tickets", height=24, font=(FONT_FAMILY, 11, "bold"), fg_color=ACCENT_BLUE, hover_color=ACCENT_HOVER, command=lambda u=user: open_member_dashboard(config, u, app, selected_teams["value"])).pack(fill="x", pady=(0, 4))
             ctk.CTkButton(btn_row, text="Change dedication", height=24, font=(FONT_FAMILY, 11, "bold"), fg_color=ACCENT_BLUE, hover_color=ACCENT_HOVER, command=lambda u=user: change_member_dedication(u)).pack(fill="x")
             
             active_card_widgets[user] = {"frame": card, "dedication_lbl": dedication_lbl, "badge_frame": badge, "status_lbl": status_lbl, "j1_badge_frame": j1_badge, "j1_lbl": j1_lbl}
@@ -2546,17 +3219,18 @@ def run_dashboard(config):
         if "members" not in config or not config["members"]: return
         sprint = get_effective_sprint(config)
         def sync():
-            active_team = config.get("selected_team", "All Teams")
+            team_filter = selected_teams["value"]
+            all_teams_selected = team_filter == set(get_teams_list(config))
             if "members_j1" not in config: config["members_j1"] = {}
             for user in list(config["members"].keys()):
-                tickets, _, logged, avatar_url = get_jira_data(config, user, force_team_filter=active_team)
+                tickets, _, logged, avatar_url = get_jira_data(config, user, force_team_filter=team_filter)
                 if avatar_url and isinstance(avatar_url, str): config["member_avatars"][user] = avatar_url
                 total_tickets = sum(len(tickets[cat]) for cat in tickets) if tickets else 0
-                if active_team != "All Teams" and total_tickets == 0:
+                if not all_teams_selected and total_tickets == 0:
                     config["members"][user] = "HIDDEN_NO_TICKETS"
                     config["members_j1"][user] = "HIDDEN_NO_TICKETS"
                 elif sprint and sprint.get("startDate"):
-                    m_ded = config.get("team_member_dedications", {}).get(active_team, {}).get(user, config.get("member_dedications", {}).get(user, 1.0))
+                    m_ded = _effective_dedication(config, user, team_filter)
                     holiday_sec = calculate_holiday_subtraction_seconds(sprint["startDate"], config.get("holiday_dates", []))
                     logged = logged or 0
 
@@ -2586,7 +3260,7 @@ def run_dashboard(config):
         try:
             file_path = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("JSON files", "*.json")], title="Export Workspace Team Data")
             if not file_path: return
-            export_payload = {"members": config.get("members", {}), "member_dedications": config.get("member_dedications", {}), "team_member_dedications": config.get("team_member_dedications", {}), "selected_team": config.get("selected_team", "All Teams"), "holiday_dates": config.get("holiday_dates", [])}
+            export_payload = {"members": config.get("members") or {}, "member_dedications": config.get("member_dedications") or {}, "team_member_dedications": config.get("team_member_dedications") or {}, "selected_team": config.get("selected_team", "All Teams"), "holiday_dates": config.get("holiday_dates") or []}
             with open(file_path, "w", encoding="utf-8") as f: json.dump(export_payload, f, indent=4)
             messagebox.showinfo("Export Successful", "Team profiles backup exported securely!")
         except Exception as e: messagebox.showerror("Export Error", f"Failed to export: {str(e)}")
@@ -2598,10 +3272,10 @@ def run_dashboard(config):
             with open(file_path, "r", encoding="utf-8") as f: imported_data = json.load(f)
             for existing_user in list(active_card_widgets.keys()): active_card_widgets[existing_user]["frame"].destroy()
             active_card_widgets.clear()
-            config["members"] = imported_data.get("members", {})
-            config["member_dedications"] = imported_data.get("member_dedications", {})
-            config["team_member_dedications"] = imported_data.get("team_member_dedications", {})
-            config["holiday_dates"] = imported_data.get("holiday_dates", [])
+            config["members"] = imported_data.get("members") or {}
+            config["member_dedications"] = imported_data.get("member_dedications") or {}
+            config["team_member_dedications"] = imported_data.get("team_member_dedications") or {}
+            config["holiday_dates"] = imported_data.get("holiday_dates") or []
             if "selected_team" in imported_data:
                 config["selected_team"] = imported_data["selected_team"]
             update_holiday_display()
@@ -2787,6 +3461,16 @@ def run_dashboard(config):
     ctk.CTkButton(controls_frame, text="🏢 Teams Overview", width=135, height=28, font=(FONT_FAMILY, 12, "bold"), fg_color=CARD_BG, hover_color=BTN_HOVER, text_color=TEXT_MAIN, border_width=1, border_color=BORDER_COLOR, command=lambda: open_teams_overview_dashboard(config, app)).pack(side="right", padx=(15, 0))
     ctk.CTkButton(controls_frame, text="📤 Export Team", width=110, height=28, font=(FONT_FAMILY, 12, "bold"), fg_color=CARD_BG, hover_color=BTN_HOVER, text_color=TEXT_MAIN, border_width=1, border_color=BORDER_COLOR, command=export_team_data).pack(side="right", padx=(15, 0))
     ctk.CTkButton(controls_frame, text="📥 Import Team", width=110, height=28, font=(FONT_FAMILY, 12, "bold"), fg_color=CARD_BG, hover_color=BTN_HOVER, text_color=TEXT_MAIN, border_width=1, border_color=BORDER_COLOR, command=import_team_data).pack(side="right", padx=(15, 0))
+    ctk.CTkButton(controls_frame, text="🎫 Open Tickets", width=130, height=28, 
+                  font=(FONT_FAMILY, 12, "bold"), fg_color=CARD_BG, hover_color=BTN_HOVER, 
+                  text_color=TEXT_MAIN, border_width=1, border_color=BORDER_COLOR,
+                  command=lambda: open_my_team_tickets_window(config, app)
+                  ).pack(side="right", padx=(15, 0))
+    ctk.CTkButton(controls_frame, text="📜 History", width=100, height=28,
+                  font=(FONT_FAMILY, 12, "bold"), fg_color=CARD_BG, hover_color=BTN_HOVER,
+                  text_color=TEXT_MAIN, border_width=1, border_color=BORDER_COLOR,
+                  command=lambda: open_history_window(config, app)
+                  ).pack(side="right", padx=(15, 0))
 
     summary = ctk.CTkFrame(app, fg_color=CARD_BG, corner_radius=12, border_width=1, border_color=BORDER_COLOR)
     summary.pack(fill="x", padx=25, pady=(0, 10))
@@ -2800,7 +3484,25 @@ def run_dashboard(config):
     main_scroll = ctk.CTkScrollableFrame(app, fg_color="transparent")
     main_scroll.pack(fill="both", expand=True, padx=25, pady=10)
 
+    # Single pending auto-refresh timer ID. Stored in a list so the nested
+    # render_main_ui closure can mutate it. Cancelling before rescheduling
+    # prevents timer accumulation: every manual refresh_main() call (sprint
+    # pin, member edit, dedication change, …) used to stack an extra 5-min
+    # loop on top of all existing ones, causing the dashboard to hammer Jira
+    # more and more frequently over the course of a session.
+    _refresh_after_id = [None]
+
     def refresh_main():
+        # Cancel any timer that is already waiting, so there is never more
+        # than one auto-refresh pending at a time regardless of how many
+        # times refresh_main() is called manually.
+        if _refresh_after_id[0] is not None:
+            try:
+                app.after_cancel(_refresh_after_id[0])
+            except Exception:
+                pass
+            _refresh_after_id[0] = None
+
         def run_fetch():
             active_team = config.get("selected_team", "All Teams")
             try:
@@ -2909,7 +3611,7 @@ def run_dashboard(config):
                     l = ctk.CTkLabel(item_box, text=f"[{t_key}] {sumry}", font=(FONT_FAMILY, 12), text_color=TEXT_MAIN, cursor="hand2", justify="left", anchor="w", wraplength=0)
                     l.pack(side="left", fill="x", expand=True, padx=15, pady=8)
                     l.bind("<Button-1>", lambda e, url=link: webbrowser.open(url))
-            app.after(REFRESH_INTERVAL, refresh_main)
+            _refresh_after_id[0] = app.after(REFRESH_INTERVAL, refresh_main)
         threading.Thread(target=run_fetch, daemon=True).start()
 
     refresh_saved_list()
