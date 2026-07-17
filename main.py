@@ -13,6 +13,8 @@ from PIL import Image
 from config import load_config, save_config, clear_config, TEAMS_LIST, REFRESH_INTERVAL , HOURS_PER_DAY 
 from jira_engine import get_jira_data, get_team_overview_data, get_team_member_logging, get_current_sprint, get_all_open_sprints, get_closed_sprints, get_sprint_member_logging, calculate_expected_hours, calculate_expected_hours_j1, calculate_expected_hours_for_sprint, format_time, get_user_identity, get_available_projects, get_available_te_projects, get_achieved_tcs_field_id, get_achieved_reqs_field_id, get_achieved_tickets_field_id, get_ticket_checklist, get_all_teams, get_my_team_open_tickets
 from notifications import start_scheduler
+import sys
+import os
 
 # =========================================================
 # 📋 To-Do/checklist presence cache — avoids re-querying Jira
@@ -2235,12 +2237,20 @@ def open_teams_overview_dashboard(config, parent=None):
 
 
 
+def resource_path(relative_path):
+    """Get path that works both when running as .py and as PyInstaller .exe"""
+    if getattr(sys, 'frozen', False):
+        base_path = sys._MEIPASS
+    else:
+        base_path = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base_path, relative_path)
 def run_dashboard(config):
     ctk.set_appearance_mode(config.get("theme", "Dark"))
     app = ctk.CTk()
-    app.geometry("1250x920") 
+    app.geometry("1250x920")
     app.title("Logging Reminder Dashboard")
     app.configure(fg_color=APP_BG)
+    app.iconbitmap(resource_path(r"C:\Users\ahmedb\Documents\scrum_app\icon.ico"))
     start_scheduler(app)
 
     # Refresh the dynamic team list in the background as soon as the app opens,
